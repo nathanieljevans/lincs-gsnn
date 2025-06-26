@@ -1,0 +1,47 @@
+run_id: default
+
+dirs:
+  data: /home/teddy/local/data 
+  extdata: /home/teddy/local/lincs-gsnn/extdata
+  runs: runs
+  preds: /home/teddy/local/lincs-traj/workflow/runs/exp/default_v02/output/predict_grid
+  bio_network: bionetwork
+  pretrain: pretrain
+
+scripts:
+  make_bio_network:     scripts/make_bio_network.py
+  pretrain:             scripts/pretrain_gsnn_with_dxdt.py
+  explain:              scripts/explain.py
+
+make_bio_network: 
+  include_mirna:    '--include_mirna'
+  include_extra:    '--include_extra'
+  dorothea_levels:  'ABCD' 
+  max_dti_kd:       1000.0
+  filter_depth:     4
+  
+pretrain: 
+  batch_size: 512
+  num_workers: 20 
+  epochs: 100
+  lr: 1e-3 
+  wd: 1e-1
+  patience: 5
+  channels: 10
+  layers: 6
+  share_layers: '' #--share_layers
+  dropout: 0. 
+  norm: 'batch'
+  checkpoint: '--checkpoint'
+
+explain: 
+  batch_size: 32 
+  epochs: 1000
+  horizon: 50
+  multiple_shooting: '--multiple_shooting'
+  lr: 2e-1
+  beta: 1e-3
+  prior: 3
+  gene_targets: 'GNPDA1 GNPDA1'
+  drugs:        'BRD-K49328571 BRD-K49328571'
+  cells:        'HME1 BT20'
