@@ -1,3 +1,45 @@
+'''
+Constructs a heterogeneous biological network graph for LINCS-GSNN project. 
+
+This script integrates multiple biological data sources to create a comprehensive network 
+representation that captures drug-target interactions, biological pathway relationships, 
+and gene regulatory networks. The resulting graph serves as the foundation for a 
+graph structured neural network that predicts drug-induced gene expression changes.
+
+Data Sources:
+- Drug-target interactions (DTI): Filtered from Targetome Extended database using 
+  affinity thresholds (Kd/Ki ≤ 1000 nM) and direct binding assays
+- Biological interactions: Protein-protein interactions, transcription factor binding, 
+  and regulatory networks from OmniPath database
+- LINCS landmark genes: Core gene set for expression prediction
+- Cell line metadata: Experimental cellular context for drug treatments 
+
+Network Structure:
+The heterogeneous graph contains three node types:
+1. Input nodes: Drugs (DRUG__), cell lines (LINE__), and genes (GENE__)
+2. Function nodes: Proteins (PROTEIN__) and RNAs (RNA__) representing biological entities; Note DNA and RNA are collapsed into a single "RNA" node. 
+3. Output nodes: Genes (GENE__) for which expression changes are predicted
+
+Edge types include:
+- Input→Function: Drug-target binding, cell line context, gene-protein mapping
+- Function→Function: Biological interactions (PPI, TF binding, regulatory networks)
+- Function→Output: Protein/RNA to gene expression mapping
+
+The network undergoes filtering to ensure connectivity between drugs and landmark genes 
+through biological pathways, with configurable depth for upstream drug targets and 
+downstream gene effects.
+
+Output:
+- PyTorch Geometric HeteroData object saved as 'bionetwork.pt'
+- Contains edge indices and node name mappings for graph neural network training
+- Includes comprehensive validation checks for network integrity
+
+This network architecture enables the GSNN to learn drug-specific gene expression 
+responses by propagating information through biologically relevant pathways.
+'''
+
+
+
 import argparse 
 import pandas as pd 
 from lincs_gsnn.proc.get_bio_interactions import get_bio_interactions 
