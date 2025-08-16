@@ -42,8 +42,8 @@ def annotate_edges(model, edge_weight):
                      'dst': np.array(model.homo_names)[model.edge_index[:, model.function_edge_mask][1].cpu()],
                      'weight': edge_weight[model.function_edge_mask.cpu()]})
 
-    res = res.assign(src_uniprot = [x.split('__')[1] for x in res.src])
-    res = res.assign(dst_uniprot = [x.split('__')[1] for x in res.dst])
+    res = res.assign(src_gene = [x.split('__')[1] for x in res.src])
+    res = res.assign(dst_gene = [x.split('__')[1] for x in res.dst])
 
     res = res.assign(src_type = [x.split('__')[0] for x in res.src])
     res = res.assign(dst_type = [x.split('__')[0] for x in res.dst])

@@ -12,8 +12,8 @@ def build_nx(func_df, targets, outputs):
 
     # drug -> function
     for i,edge in targets.iterrows(): 
-        if ('PROTEIN__' + edge.target) in G: 
-            G.add_edge('DRUG__' + edge.pert_id, 'PROTEIN__' + edge.target)
+        if edge.target_name in G: 
+            G.add_edge('DRUG__' + edge.pert_id, edge.target_name)
         else: 
             print(f'warning: {edge.target} is not present in graph, this DTI will not be added.')
 
@@ -25,9 +25,14 @@ def build_nx(func_df, targets, outputs):
     return G
 
 def filter_func_nodes(func_names, func_df, targets, lincs, drugs, filter_depth=10): 
+    ''' 
+    changing the way we do this... since it's a dxdt problem, which doesen't depend ONLY on drugs, all lincs should also be treated as leafs. 
+    ''' 
+
+
     G = build_nx(func_df, targets, lincs)
     
-    subgraph = subset_graph(G, filter_depth, roots=['DRUG__' + x for x in drugs], leafs=['LINCS__' + x for x in lincs], verbose=True)
+    subgraph = subset_graph(G, filter_depth, roots=['DRUG__' + x for x in drugs] + ['LINCS__' + x for x in lincs], leafs=['LINCS__' + x for x in lincs], verbose=True)
     nodes = list(subgraph.nodes())
 
     func_mask = np.array([n in nodes for n in func_names])

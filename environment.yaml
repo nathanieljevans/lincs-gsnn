@@ -1,0 +1,30 @@
+name: lincs-gsnn
+
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  - python
+  - pandas
+  - numpy
+  - pytorch
+  - umap-learn
+  - pyg
+  - networkx
+  - scikit-learn
+  - scipy
+  - snakemake
+  - matplotlib
+  - seaborn
+  - h5py
+  - torchdiffeq
+  - joblib
+  - pip
+  - pip:
+      - pypath-omnipath
+      - omnipath
+      - ipykernel

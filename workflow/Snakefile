@@ -25,7 +25,6 @@ rule all:
     input:
         os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
         os.path.join(PRETRAIN_DIR, f"pretrained_model.pt"),
-        os.path.join(EXPLAIN_DIR, "explain_flag.log"),
 # ------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------
 
@@ -53,8 +52,8 @@ rule make_bio_network:
             --out  {params.out} \
             --extdata {params.extdata} \
             --meta {params.meta} \
-            --include_mirna {params.include_mirna} \
-            --include_extra {params.include_extra} \
+            {params.include_mirna} \
+            {params.include_extra} \
             --dorothea_levels {params.dorothea_levels} \
             --max_dti_kd {params.max_dti_kd} \
             --filter_depth {params.filter_depth}
@@ -75,6 +74,7 @@ rule pretrain_gsnn:
         epochs = cfg['pretrain']["epochs"],
         lr = cfg['pretrain']["lr"],
         wd = cfg['pretrain']["wd"],
+        init = cfg['pretrain']["init"],
         patience = cfg['pretrain']["patience"],
         channels = cfg['pretrain']["channels"],
         layers = cfg['pretrain']["layers"],
@@ -94,6 +94,7 @@ rule pretrain_gsnn:
             --epochs {params.epochs} \
             --lr {params.lr} \
             --wd {params.wd} \
+            --init {params.init} \
             --patience {params.patience} \
             --channels {params.channels} \
             --layers {params.layers} \
@@ -101,47 +102,4 @@ rule pretrain_gsnn:
             --dropout {params.dropout} \
             --norm {params.norm} \
             {params.checkpoint}
-        """
-
-rule explain:
-    input:
-        bionet     = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
-        pretrained = os.path.join(PRETRAIN_DIR, "pretrained_model.pt"),
-        preds      = cfg['dirs']['preds']
-    output:
-        flag        = os.path.join(EXPLAIN_DIR, 'explain_flag.log')
-    params:
-        script             = cfg['scripts']["explain"],
-        data               = cfg['dirs']['preds'],
-        out                = EXPLAIN_DIR,
-        pretrained         = PRETRAIN_DIR,
-        bionet             = BIO_NET_DIR,
-        batch_size         = cfg['explain']["batch_size"],
-        horizon            = cfg['explain']["horizon"],
-        multiple_shooting  = cfg['explain']["multiple_shooting"],
-        lr                 = cfg['explain']["lr"],
-        beta               = cfg['explain']["beta"],
-        gene_targets        = cfg['explain']["gene_targets"],
-        drugs               = cfg['explain']["drugs"],
-        cells               = cfg['explain']["cells"],
-        prior              = cfg['explain']["prior"],
-        epochs             = cfg['explain']["epochs"],
-    shell:
-        """
-        python {params.script} \
-          --data {params.data} \
-          --out {params.out} \
-          --pretrained {params.pretrained} \
-          --bionet {params.bionet} \
-          --batch_size {params.batch_size} \
-          --epochs {params.epochs} \
-          --horizon {params.horizon} \
-          {params.multiple_shooting} \
-          --lr {params.lr} \
-          --beta {params.beta} \
-          --gene_targets {params.gene_targets} \
-          --prior {params.prior} \
-          --drugs {params.drugs} \
-          --cells {params.cells}
-        touch {params.out}/explain_flag.log
         """

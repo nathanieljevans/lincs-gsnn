@@ -1,7 +1,5 @@
 import argparse 
 import pandas as pd 
-from lincs_gsnn.proc.get_bio_interactions import get_bio_interactions 
-from lincs_gsnn.proc.subset import filter_func_nodes
 import torch_geometric as pyg
 import numpy as np
 import torch
@@ -9,7 +7,6 @@ import torch
 from gsnn.models.GSNN import GSNN 
 from torch.utils.data import DataLoader 
 from sklearn.metrics import r2_score
-from lincs_gsnn.data.TrajDataset import TrajDataset
 from lincs_gsnn.data.DXDTDataset import DXDTDataset
 
 import time 
@@ -32,6 +29,7 @@ def get_args():
     parser.add_argument("--dropout",            type=float,             default=0.1,                               help="dropout rate for the model")
     parser.add_argument("--norm",               type=str,               default='batch',                           help="normalization type for the model [batch, layer, none]")
     parser.add_argument("--checkpoint",         action='store_true',    default=False,                              help="whether to use checkpointing in the model")
+    parser.add_argument("--init",               type=str,               default='degree_normalized',               help="initialization type for the model")
 
     args = parser.parse_args() 
     return args
@@ -81,11 +79,22 @@ if __name__ == '__main__':
     print('--'*40)
 
     dxdt_meta = pd.read_csv(f'{args.data}/dxdt_meta.csv')
-
+    src_gene_names = pd.read_csv(f'{args.data}/gene_names.csv')['gene_names'].tolist()
     data = torch.load(f'{args.bionet}/bionetwork.pt', weights_only=False)
+
+    # remove any drugs not in network  
+    pert_ids_net = [x.split('__')[1] for x in data.node_names_dict['input'] if 'DRUG__' in x]
+    pert_ids_meta = dxdt_meta['pert_id'].unique().tolist() 
+    missing_ids = set(pert_ids_meta) - set(pert_ids_net) 
+    print(f'Some drugs in meta are not in network: {missing_ids}')
+    dxdt_meta = dxdt_meta[dxdt_meta['pert_id'].isin(pert_ids_net)]
+
+    print('# output nodes', len(data.node_names_dict['output']))
 
     dataset = DXDTDataset(dxdt_meta, 
                       input_names=data.node_names_dict['input'], 
+                      output_names=data.node_names_dict['output'], 
+                      src_names=src_gene_names, 
                       obs_dir=f'{args.data}/dxdt/')
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, persistent_workers=True)
@@ -99,7 +108,11 @@ if __name__ == '__main__':
                 share_layers = args.share_layers,
                 dropout = args.dropout, 
                 checkpoint=args.checkpoint,
-                norm = args.norm).to(device) 
+                init = args.init,
+                norm = args.norm, 
+                add_function_self_edges = True, 
+                bias = True, 
+                residual = True).to(device) 
     
     print('# parameters:', sum(p.numel() for p in model.parameters() if p.requires_grad))
 

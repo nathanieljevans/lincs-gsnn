@@ -80,7 +80,7 @@ def train(args, func, optim, loader, edge_weight, crit, t, ):
     metrics ={'mse':[], 'r2':[], 'edge_weight_norm':[]}
     for epoch in range(args.epochs):
         epoch_metrics = {'mse':0, 'r2':0, 'edge_weight_norm':0}
-        for i, (xt, _, X) in enumerate(dataloader):
+        for i, (xt, _, X) in enumerate(loader):
             optim.zero_grad()
 
             X = X.to(device); xt = xt.to(device)
@@ -244,8 +244,8 @@ def annotate_edges(model, edge_weight):
                      'dst': np.array(model.homo_names)[model.edge_index[:, model.function_edge_mask][1].cpu()],
                      'weight': edge_weight.sigmoid().detach().cpu().numpy()[model.function_edge_mask.cpu()]})
 
-    res = res.assign(src_uniprot = [x.split('__')[1] for x in res.src])
-    res = res.assign(dst_uniprot = [x.split('__')[1] for x in res.dst])
+    res = res.assign(src_gene = [x.split('__')[1] for x in res.src])
+    res = res.assign(dst_gene = [x.split('__')[1] for x in res.dst])
 
     res = res.assign(src_type = [x.split('__')[0] for x in res.src])
     res = res.assign(dst_type = [x.split('__')[0] for x in res.dst])
