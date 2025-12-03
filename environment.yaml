@@ -11,14 +11,15 @@ dependencies:
   - python
   - pandas
   - numpy
-  - pytorch
+  - pytorch::pytorch
   - umap-learn
-  - pyg
+  - pyg::pyg
   - networkx
   - scikit-learn
   - scipy
   - snakemake
   - matplotlib
+  - pysftp
   - seaborn
   - h5py
   - torchdiffeq

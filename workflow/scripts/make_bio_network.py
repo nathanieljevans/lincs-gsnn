@@ -64,7 +64,9 @@ def get_args():
     parser.add_argument('--dorothea_levels',    type=str,               default='ABCD',                               help='the dorothea levels to include in the function graph [A-D]')
     parser.add_argument("--max_dti_kd",         type=float,             default=1000.0,                             help="maximum DTI affinity (Kd) to include in the graph")
     parser.add_argument("--filter_depth",       type=int,               default=4,                                 help="the depth to search for upstream drugs and downstream lincs in the node filter process")
-
+    parser.add_argument("--remove_output_edges", action='store_true',   default=False,                              help="remove output edges from the function graph")
+    parser.add_argument("--n_edges_to_remove",  type=int,               default=1,                               help="the number of edges to remove from the function graph")
+    parser.add_argument("--seed",               type=int,               default=42,                                help="the random seed to use for the edge removal process")
     args = parser.parse_args() 
     return args
 
@@ -158,6 +160,69 @@ if __name__ == '__main__':
                              mediator_edges=mediator_edges, 
                              input_names=gene_names,            # force all gene inputs to be included in graph even if there are no edges 
                              output_names=gene_names)           # force all gene outputs to be included in graph even if there are no edges 
+
+
+    # we want to remove function -> output edges, however, output edges go from RNA__NODE -> GENE__NODE 
+    # so we need to remove edges from FUNCTION__NODE -> RNA__NODE --> GENE__NODE 
+
+    if args.remove_output_edges:  
+
+        print('-'*40)
+        print('Removing output edges...')
+        print('-'*40)
+        print() 
+
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+        n_edges_before = data.edge_index_dict['function', 'to', 'function'].shape[1]
+        removed_edges = {'src_idx': [], 'dst_idx': [], 'src_name': [], 'dst_name': []}
+        for output_node in data.node_names_dict['output']:  
+
+            # get RNA__NODE
+            rna_node = 'RNA__' + output_node.split('__')[1]
+            if rna_node not in data.node_names_dict['function']: 
+                print(f'WARNING: {output_node} has no RNA__NODE, skipping...')
+                continue  
+            rna_idx = data.node_names_dict['function'].index(rna_node)
+
+            # candidate edges (to remove)
+            src, dst = data.edge_index_dict['function', 'to', 'function']
+            edge_candidate_ixs = (dst == rna_idx).nonzero(as_tuple=True)[0].view(-1).detach().cpu().numpy()
+
+            if len(edge_candidate_ixs)  <= (args.n_edges_to_remove):
+                print(f'WARNING: {output_node} has only {len(edge_candidate_ixs)} edges [n_edges_to_remove={args.n_edges_to_remove}], skipping...')
+                continue 
+
+            ixs_to_remove = np.random.choice(edge_candidate_ixs, size=args.n_edges_to_remove, replace=False) 
+
+            # remove edges 
+            mask_to_keep = np.ones(src.shape[0], dtype=bool)
+            mask_to_keep[ixs_to_remove] = False 
+            data.edge_index_dict['function', 'to', 'function'] = data.edge_index_dict['function', 'to', 'function'][:, mask_to_keep]
+
+            src_ixs = src[ixs_to_remove].tolist() 
+            dst_ixs = dst[ixs_to_remove].tolist() 
+            removed_edges['src_idx'] += src_ixs
+            removed_edges['dst_idx'] += dst_ixs
+            func_names = np.array(data.node_names_dict['function'])
+            removed_edges['src_name'] += func_names[src_ixs].tolist()
+            removed_edges['dst_name'] += func_names[dst_ixs].tolist()
+
+        removed_edges = pd.DataFrame(removed_edges)
+        removed_edges.to_csv(f'{args.out}/removed_edges.csv', index=False)
+
+        n_edges_after = data.edge_index_dict['function', 'to', 'function'].shape[1] 
+
+        n_removed = n_edges_before - n_edges_after 
+
+        assert n_removed == len(removed_edges), 'number of removed edges does not match recorded number of removed edges'
+
+        print(f'removed {n_removed} edges, {n_edges_after} edges remaining')
+        
+        print('-'*40)
+        print('-'*40)
+
 
     print('saving data...')
     torch.save(data, f'{args.out}/bionetwork.pt')

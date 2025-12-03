@@ -1,0 +1,54 @@
+run_id: default
+
+dirs:
+  data: /home/exacloud/gscratch/mcweeney_lab/evans/data    
+  extdata: ../extdata/
+  runs: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-gsnn
+  preds: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/exp/default_v03/output/predict_grid
+  bio_network: bionetwork 
+  pretrain: pretrain
+
+scripts:
+  make_bio_network:     scripts/make_bio_network.py
+  pretrain:             scripts/pretrain_gsnn_with_dxdt.py
+  explain:              scripts/explain.py
+  infer_output_edges:   scripts/infer_output_edges.py
+  eval_inferred_edges:  scripts/eval_inferred_edges.py
+
+make_bio_network: 
+  include_mirna:    '' # '--include_mirna'
+  include_extra:    '' #'--include_extra'
+  dorothea_levels:  'AB' 
+  max_dti_kd:       1000.0
+  filter_depth:     5
+  remove_output_edges: '--remove_output_edges' # '--remove_output_edges' to enable edge removal
+  n_edges_to_remove: 2
+  seed: 0
+  
+pretrain: 
+  batch_size: 256
+  num_workers: 16 
+  epochs: 50
+  lr: 1e-3
+  wd: 0
+  init: 'degree_normalized'
+  patience: 25
+  channels: 8
+  layers: 6
+  share_layers: '' #--share_layers
+  dropout: 0
+  norm: 'batch'
+  checkpoint: '--checkpoint'
+
+infer_output_edges:
+  batch_size: 128
+  train_prop: 0.75
+  lr: 1e-2
+  wd: 1e-8
+  epochs: 5
+  agg: 'all'
+  use_batchnorm: '--use_batchnorm'
+
+eval_inferred_edges:
+  agg_method: 'mean' # NOTE: DEPRECATED (uses mean no matter what)
+  target_metric: 'r2'  # Options: 'r2_gain', 'r_gain', 'snr', 'p_value', 'r2', 'r', 'mse'

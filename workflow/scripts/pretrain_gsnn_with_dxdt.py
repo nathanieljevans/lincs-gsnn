@@ -8,6 +8,7 @@ from gsnn.models.GSNN import GSNN
 from torch.utils.data import DataLoader 
 from sklearn.metrics import r2_score
 from lincs_gsnn.data.DXDTDataset import DXDTDataset
+from DeepTraj.models.DeepTraj import dose_transform
 
 import time 
 
@@ -15,8 +16,9 @@ def get_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--data",               type=str,               default='../../../data/',                   help="path to data directory")
-    parser.add_argument("--out",                type=str,               default='../../proc/',                help="path to data directory")
+    parser.add_argument("--out",                type=str,               default='../../proc/',                help="path to output directory")
     parser.add_argument("--bionet",             type=str,               default='../../proc/bionetwork.pt',       help="path to bionetwork file")
+    parser.add_argument("--sample",             type=str,               required=True,                             help="sample directory name (e.g., sample_0)")
     parser.add_argument("--batch_size",         type=int,               default=64,                                help="batch size for training")
     parser.add_argument("--num_workers",        type=int,               default=4,                                 help="number of workers for dataloader")
     parser.add_argument("--epochs",             type=int,               default=100,                               help="number of epochs to train for")
@@ -78,6 +80,7 @@ if __name__ == '__main__':
     print(args)
     print('--'*40)
 
+    # Load metadata and bionetwork
     dxdt_meta = pd.read_csv(f'{args.data}/dxdt_meta.csv')
     src_gene_names = pd.read_csv(f'{args.data}/gene_names.csv')['gene_names'].tolist()
     data = torch.load(f'{args.bionet}/bionetwork.pt', weights_only=False)
@@ -90,12 +93,18 @@ if __name__ == '__main__':
     dxdt_meta = dxdt_meta[dxdt_meta['pert_id'].isin(pert_ids_net)]
 
     print('# output nodes', len(data.node_names_dict['output']))
+    print(f'Training on sample: {args.sample}')
+
+    # Update paths for the new sample-based structure
+    obs_dir = f'{args.data}/{args.sample}/obs/'
+    dxdt_dir = f'{args.data}/{args.sample}/dxdt/'
 
     dataset = DXDTDataset(dxdt_meta, 
-                      input_names=data.node_names_dict['input'], 
-                      output_names=data.node_names_dict['output'], 
-                      src_names=src_gene_names, 
-                      obs_dir=f'{args.data}/dxdt/')
+                         input_names=data.node_names_dict['input'], 
+                         output_names=data.node_names_dict['output'], 
+                         src_names=src_gene_names, 
+                         obs_dir=obs_dir,
+                         dxdt_dir=dxdt_dir)
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, persistent_workers=True)
     
@@ -122,8 +131,8 @@ if __name__ == '__main__':
 
     model = train(args, model, optim, scheduler)
 
-    torch.save(model, f'{args.out}/pretrained_model.pt')
-    torch.save(torch.tensor([dataset._scale]), f'{args.out}/dxdt_scale.pt')
+    torch.save(model, f'{args.out}/pretrained_model_{args.sample}.pt')
+    torch.save(torch.tensor([dataset._scale]), f'{args.out}/dxdt_scale_{args.sample}.pt')
 
 
 

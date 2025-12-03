@@ -16,6 +16,9 @@ class DXDTDataset(Dataset):
         Complete list of node names (genes, drugs, cell lines, …) used by the GSNN.
     obs_dir : str
         Directory that contains the `.pt` observation files referenced in `meta['file_name']`.
+    dxdt_dir : str | None
+        Optional directory that contains separate `.pt` dxdt files. If None, expects
+        combined files in obs_dir where obs[0] is gene expression and obs[1] is dxdt.
     scale : float | None
         If None, the global std-dev of dx/dt is estimated on the fly and the returned
         dx/dt is divided by it. Otherwise the provided value is used.
@@ -27,11 +30,12 @@ class DXDTDataset(Dataset):
         to match the order of `GENE__` entries in `input_names`.
     """
 
-    def __init__(self, meta, input_names, output_names, src_names, obs_dir: str = "", scale: Optional[float] = None,
-                 return_time: bool = False):
+    def __init__(self, meta, input_names, output_names, src_names, obs_dir: str = "", dxdt_dir: Optional[str] = None, 
+                 scale: Optional[float] = None, return_time: bool = False):
 
         self.meta = meta
         self.obs_dir = obs_dir
+        self.dxdt_dir = dxdt_dir  # If None, expects combined files in obs_dir
         self.input_names = input_names  # GSNN input order
         self.output_names = output_names  # GSNN output order
 
@@ -88,11 +92,12 @@ class DXDTDataset(Dataset):
     # ---------------------------------------------------------------------- #
     def get(self, idx: int):
         row = self.meta.iloc[idx]
-        obs_path = f"{self.obs_dir}/{row['file_name']}"
-        obs = torch.load(obs_path, map_location="cpu", weights_only=False).type(torch.float32)
+        
+        dxdt_name = row['file_name']
+        dxdt_path = f"{self.dxdt_dir}/{dxdt_name}"
+        
+        x, dxdt = torch.load(dxdt_path, map_location="cpu", weights_only=False).type(torch.float32)
 
-        x = obs[0]    # gene expression (trajectory order)
-        dxdt = obs[1] # ground-truth derivative (trajectory order)
 
         assert not torch.isnan(x).any(), f'x has nans at index {idx}'
         assert not torch.isnan(dxdt).any(), f'dxdt has nans at index {idx}'
