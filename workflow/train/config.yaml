@@ -1,0 +1,38 @@
+run_id: default
+
+dirs:
+  data: /home/exacloud/gscratch/mcweeney_lab/evans/data    
+  extdata: ../extdata/
+  runs: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-gsnn
+  preds: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/exp/default_v03/output/predict_grid
+  bio_network: bionetwork 
+  pretrain: pretrain
+
+scripts:
+  make_bio_network:     scripts/make_bio_network.py
+  pretrain:             scripts/pretrain_gsnn_with_dxdt.py
+
+make_bio_network: 
+  include_mirna:    '--include_mirna'
+  include_extra:    '' #'--include_extra'
+  dorothea_levels:  'ABC' 
+  max_dti_kd:       1000.0
+  filter_depth:     5
+  remove_output_edges: '' # '--remove_output_edges' # '--remove_output_edges' to enable edge removal
+  n_edges_to_remove: 0
+  seed: 0
+  
+pretrain: 
+  batch_size: 256
+  num_workers: 16 
+  epochs: 50
+  lr: 5e-4
+  wd: 1e-6
+  init: 'degree_normalized'
+  patience: 25
+  channels: 8
+  layers: 6
+  share_layers: '' #--share_layers
+  dropout: 0.05
+  norm: 'batch'
+  checkpoint: '--checkpoint'

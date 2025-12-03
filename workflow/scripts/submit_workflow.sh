@@ -12,7 +12,7 @@
 
 source ~/.zshrc
 
-cd /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/lincs-gsnn/workflow
+cd /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/lincs-gsnn/workflow/train/
 
 conda activate lincs-gsnn
 

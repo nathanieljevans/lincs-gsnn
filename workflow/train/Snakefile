@@ -1,0 +1,118 @@
+import os, datetime
+import yaml 
+import glob
+
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+configfile: "config.yaml"
+cfg = config
+
+RUN_ID  = cfg["run_id"]
+
+BIO_NET_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["bio_network"])
+PRETRAIN_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["pretrain"])
+
+os.makedirs(BIO_NET_DIR, exist_ok=True)
+os.makedirs(PRETRAIN_DIR, exist_ok=True)
+
+# Find all sample directories
+PREDS_DIR = cfg['dirs']["preds"]
+SAMPLES = [os.path.basename(p) for p in glob.glob(os.path.join(PREDS_DIR, "sample_*")) if os.path.isdir(p)]
+print(f"Found samples: {SAMPLES}")
+
+
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+rule all:
+    input:
+        os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
+        expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"), sample=SAMPLES),
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+
+
+rule make_bio_network:
+    ''''''
+    output:
+        net = os.path.join(BIO_NET_DIR, f"bionetwork.pt")
+    params:
+        script = cfg['scripts']["make_bio_network"],
+        data = cfg['dirs']["data"],
+        extdata = cfg['dirs']["extdata"],
+        meta = cfg['dirs']["preds"],
+        out = BIO_NET_DIR,
+        include_mirna = cfg['make_bio_network']["include_mirna"],
+        include_extra = cfg['make_bio_network']["include_extra"],
+        dorothea_levels = cfg['make_bio_network']["dorothea_levels"],
+        max_dti_kd = cfg['make_bio_network']["max_dti_kd"],
+        filter_depth = cfg['make_bio_network']["filter_depth"],
+        remove_output_edges = cfg['make_bio_network']["remove_output_edges"],
+        n_edges_to_remove = cfg['make_bio_network']["n_edges_to_remove"],
+        seed = cfg['make_bio_network']["seed"],
+
+    shell:
+        """
+        python {params.script} \
+            --data {params.data} \
+            --out  {params.out} \
+            --extdata {params.extdata} \
+            --meta {params.meta} \
+            {params.include_mirna} \
+            {params.include_extra} \
+            --dorothea_levels {params.dorothea_levels} \
+            --max_dti_kd {params.max_dti_kd} \
+            --filter_depth {params.filter_depth} \
+            {params.remove_output_edges} \
+            --n_edges_to_remove {params.n_edges_to_remove} \
+            --seed {params.seed}
+        """
+
+rule pretrain_gsnn:
+    input:
+        bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        sample_obs = os.path.join(cfg['dirs']["preds"], "{sample}", "obs"),
+        sample_dxdt = os.path.join(cfg['dirs']["preds"], "{sample}", "dxdt"),
+    output:
+        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
+        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+    params:
+        script = cfg['scripts']["pretrain"],
+        data = cfg['dirs']['preds'],
+        out = PRETRAIN_DIR,
+        batch_size = cfg['pretrain']["batch_size"],
+        num_workers = cfg['pretrain']["num_workers"],
+        epochs = cfg['pretrain']["epochs"],
+        lr = cfg['pretrain']["lr"],
+        wd = cfg['pretrain']["wd"],
+        init = cfg['pretrain']["init"],
+        patience = cfg['pretrain']["patience"],
+        channels = cfg['pretrain']["channels"],
+        layers = cfg['pretrain']["layers"],
+        share_layers = cfg['pretrain']["share_layers"],
+        dropout = cfg['pretrain']["dropout"],
+        norm = cfg['pretrain']["norm"],
+        checkpoint = cfg['pretrain']["checkpoint"],
+
+    shell:
+        """
+        python {params.script} \
+            --data {params.data} \
+            --out {params.out} \
+            --bionet $(dirname {input.bionet}) \
+            --sample {wildcards.sample} \
+            --batch_size {params.batch_size} \
+            --num_workers {params.num_workers} \
+            --epochs {params.epochs} \
+            --lr {params.lr} \
+            --wd {params.wd} \
+            --init {params.init} \
+            --patience {params.patience} \
+            --channels {params.channels} \
+            --layers {params.layers} \
+            {params.share_layers} \
+            --dropout {params.dropout} \
+            --norm {params.norm} \
+            {params.checkpoint}
+        """
