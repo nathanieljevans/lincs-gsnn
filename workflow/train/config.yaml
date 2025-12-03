@@ -1,4 +1,4 @@
-run_id: default
+run_id: all_edges_included
 
 dirs:
   data: /home/exacloud/gscratch/mcweeney_lab/evans/data    
