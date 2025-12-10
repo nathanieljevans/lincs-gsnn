@@ -31,6 +31,7 @@ rule all:
     input:
         os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
         expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"), sample=SAMPLES),
+        expand(os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
 
 rule all_contrastive_palbociclib_rb1:
     '''Run contrastive explanation for Palbociclib/RB1 for all samples'''
