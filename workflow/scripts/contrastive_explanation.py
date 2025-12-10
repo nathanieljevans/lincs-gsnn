@@ -106,7 +106,7 @@ def get_args():
     assert args.cell_line_2 in args.dxdt_meta.cell_iname.unique(), f'Cell line {args.cell_line_2} not found in the data'
     assert args.pert_id in args.dxdt_meta.pert_id.unique(), f'Perturbation {args.pert_id} not found in the data'
     assert args.dose in args.dxdt_meta.dose.unique(), f'Dose {args.dose} not found in the data'
-    assert args.horizon <= args.dxdt_meta.n_time_pts.max(), f'Horizon {args.horizon} is greater than the maximum number of time points {args.dxdt_meta.n_time_pts.max()}' 
+    assert args.horizon <= args.dxdt_meta.time.max(), f'Horizon {args.horizon} is greater than the maximum number of time points {args.dxdt_meta.time.max()}' 
 
     return args 
 
