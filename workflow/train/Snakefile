@@ -13,9 +13,11 @@ RUN_ID  = cfg["run_id"]
 
 BIO_NET_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["bio_network"])
 PRETRAIN_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["pretrain"])
+CONTRASTIVE_PALBOCICLIB_RB1_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['contrastive_explanation_palbociclib_rb1']["output_dir"])
 
 os.makedirs(BIO_NET_DIR, exist_ok=True)
 os.makedirs(PRETRAIN_DIR, exist_ok=True)
+os.makedirs(CONTRASTIVE_PALBOCICLIB_RB1_DIR, exist_ok=True)
 
 # Find all sample directories
 PREDS_DIR = cfg['dirs']["preds"]
@@ -29,6 +31,11 @@ rule all:
     input:
         os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
         expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"), sample=SAMPLES),
+
+rule all_contrastive_palbociclib_rb1:
+    '''Run contrastive explanation for Palbociclib/RB1 for all samples'''
+    input:
+        expand(os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
 # ------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------
 
@@ -115,4 +122,68 @@ rule pretrain_gsnn:
             --dropout {params.dropout} \
             --norm {params.norm} \
             {params.checkpoint}
+        """
+
+rule contrastive_explanation_palbociclib_rb1:
+    '''
+    Contrastive explanation for Palbociclib (CDK4/6 inhibitor) - RB1-dependent vs RB1-null response.
+    Compares MCF7 (RB1-proficient) vs MDAMB468 (RB1-deficient) cell lines.
+    Target gene: CCNE2 (E2F-regulated proliferation gene).
+    '''
+    input:
+        bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
+        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+    output:
+        csv = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.csv"),
+        pt = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.pt"),
+    params:
+        script = cfg['scripts']["contrastive_explanation"],
+        root_gsnn = os.path.join(cfg['dirs']['runs'], RUN_ID),
+        root_traj = cfg['dirs']["preds"].replace('/predict_grid', ''),
+        out_dir = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}"),
+        target_gene = cfg['contrastive_explanation_palbociclib_rb1']["target_gene"],
+        cell_line_1 = cfg['contrastive_explanation_palbociclib_rb1']["cell_line_1"],
+        cell_line_2 = cfg['contrastive_explanation_palbociclib_rb1']["cell_line_2"],
+        pert_id = cfg['contrastive_explanation_palbociclib_rb1']["pert_id"],
+        dose = cfg['contrastive_explanation_palbociclib_rb1']["dose"],
+        horizon = cfg['contrastive_explanation_palbociclib_rb1']["horizon"],
+        n_time_pts = cfg['contrastive_explanation_palbociclib_rb1']["n_time_pts"],
+        method = cfg['contrastive_explanation_palbociclib_rb1']["method"],
+        tol = cfg['contrastive_explanation_palbociclib_rb1']["tol"],
+        hard = cfg['contrastive_explanation_palbociclib_rb1']["hard"],
+        beta = cfg['contrastive_explanation_palbociclib_rb1']["beta"],
+        lr = cfg['contrastive_explanation_palbociclib_rb1']["lr"],
+        prior = cfg['contrastive_explanation_palbociclib_rb1']["prior"],
+        iters = cfg['contrastive_explanation_palbociclib_rb1']["iters"],
+        entropy = cfg['contrastive_explanation_palbociclib_rb1']["entropy"],
+        grad_norm_clip = cfg['contrastive_explanation_palbociclib_rb1']["grad_norm_clip"],
+        free_edges = cfg['contrastive_explanation_palbociclib_rb1']["free_edges"],
+        explanation_target = cfg['contrastive_explanation_palbociclib_rb1']["explanation_target"],
+    shell:
+        """
+        mkdir -p {params.out_dir}
+        python {params.script} \
+            --root_gsnn {params.root_gsnn} \
+            --root_traj {params.root_traj} \
+            --sample_id {wildcards.sample} \
+            --target_gene {params.target_gene} \
+            --cell_line_1 {params.cell_line_1} \
+            --cell_line_2 {params.cell_line_2} \
+            --pert_id {params.pert_id} \
+            --dose {params.dose} \
+            --horizon {params.horizon} \
+            --n_time_pts {params.n_time_pts} \
+            --method {params.method} \
+            --tol {params.tol} \
+            {params.hard} \
+            --beta {params.beta} \
+            --lr {params.lr} \
+            --prior {params.prior} \
+            --iters {params.iters} \
+            --entropy {params.entropy} \
+            --grad_norm_clip {params.grad_norm_clip} \
+            --free_edges {params.free_edges} \
+            --explanation_target {params.explanation_target} \
+            --out {params.out_dir}
         """

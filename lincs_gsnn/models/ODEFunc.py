@@ -32,11 +32,11 @@ class ODEFunc(torch.nn.Module):
 
         return dxdt
 
-    def integrate(self, x, time, node_mask=None, edge_mask=None, method='dopri5'):
+    def integrate(self, x, time, node_mask=None, edge_mask=None, method='dopri5', tol=1e-4):
 
         self.set_node_mask(node_mask)
         self.set_edge_mask(edge_mask)
 
-        out = odeint(func=self, y0=x, t=time, method=method) # shape: (n_time, B, n_input_nodes)
+        out = odeint(func=self, y0=x, t=time, method=method, atol=tol, rtol=tol) # shape: (n_time, B, n_input_nodes)
 
         return out[:, :, self.gene_ixs] # ordered as self.input_names[self.gene_ixs]

@@ -11,6 +11,7 @@ dirs:
 scripts:
   make_bio_network:     ../scripts/make_bio_network.py
   pretrain:             ../scripts/pretrain_gsnn_with_dxdt.py
+  contrastive_explanation: ../scripts/contrastive_explanation.py
 
 make_bio_network: 
   include_mirna:    '--include_mirna'
@@ -36,3 +37,26 @@ pretrain:
   dropout: 0.05
   norm: 'batch'
   checkpoint: '--checkpoint'
+
+# Contrastive explanation for Palbociclib (CDK4/6 inhibitor) - RB1 response
+# Compares MCF7 (RB1-proficient) vs MDAMB468 (RB1-deficient) cell lines
+contrastive_explanation_palbociclib_rb1:
+  output_dir: contrastive_explanation_palbociclib_rb1
+  target_gene: 'CCNE2'
+  cell_line_1: 'MCF7'
+  cell_line_2: 'MDAMB468'
+  pert_id: 'BRD-K51313569' # Palbociclib
+  dose: 10.0
+  horizon: 72
+  n_time_pts: 10
+  method: 'euler'
+  tol: 1e-4
+  hard: ''  # empty for False, '--hard' for True
+  beta: 5e-4
+  lr: 5e-2
+  prior: 5
+  iters: 500
+  entropy: 1.0
+  grad_norm_clip: 1.0
+  free_edges: 100
+  explanation_target: 'edge'
