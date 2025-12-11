@@ -12,6 +12,7 @@ scripts:
   make_bio_network:     ../scripts/make_bio_network.py
   pretrain:             ../scripts/pretrain_gsnn_with_dxdt.py
   contrastive_explanation: ../scripts/contrastive_explanation.py
+  aggregate_contrastive: ../scripts/aggregate_contrastive_results.py
 
 make_bio_network: 
   include_mirna:    '--include_mirna'

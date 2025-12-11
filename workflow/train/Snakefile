@@ -31,7 +31,7 @@ rule all:
     input:
         os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
         expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"), sample=SAMPLES),
-        expand(os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
+        os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_cres.csv"),
 
 rule all_contrastive_palbociclib_rb1:
     '''Run contrastive explanation for Palbociclib/RB1 for all samples'''
@@ -138,6 +138,7 @@ rule contrastive_explanation_palbociclib_rb1:
     output:
         csv = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.csv"),
         pt = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.pt"),
+        out_dict = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "out_dict_{sample}.pt"),
     params:
         script = cfg['scripts']["contrastive_explanation"],
         root_gsnn = os.path.join(cfg['dirs']['runs'], RUN_ID),
@@ -187,4 +188,30 @@ rule contrastive_explanation_palbociclib_rb1:
             --free_edges {params.free_edges} \
             --explanation_target {params.explanation_target} \
             --out {params.out_dir}
+        """
+
+rule aggregate_contrastive_palbociclib_rb1:
+    '''
+    Aggregate contrastive explanation results from all samples.
+    Merges cres DataFrames (outer merge with sample suffix).
+    Aggregates out_dicts into a single dictionary.
+    '''
+    input:
+        csvs = expand(os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
+        out_dicts = expand(os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "out_dict_{sample}.pt"), sample=SAMPLES),
+    output:
+        cres_csv = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_cres.csv"),
+        cres_parquet = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_cres.parquet"),
+        out_dict = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_out_dict.pt"),
+    params:
+        script = cfg['scripts']["aggregate_contrastive"],
+        input_dir = CONTRASTIVE_PALBOCICLIB_RB1_DIR,
+        out_dir = CONTRASTIVE_PALBOCICLIB_RB1_DIR,
+        name = "aggregated",
+    shell:
+        """
+        python {params.script} \
+            --input_dir {params.input_dir} \
+            --out {params.out_dir} \
+            --name {params.name}
         """

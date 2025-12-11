@@ -244,9 +244,6 @@ if __name__ == '__main__':
     print()
     args = get_args()
     print('--'*40)
-    print('Arguments:')
-    print(args)
-    print('--'*40)
 
     x1, x2 = get_x(args) 
     xt_hat_w_inputs_1, xt_hat_1 = predict_xt(args, x1)
@@ -254,8 +251,27 @@ if __name__ == '__main__':
 
     cres = run_contrastive_explanation(args, x1, x2, xt_hat_w_inputs_1, xt_hat_w_inputs_2, args.target_gene_output_ix)
 
+    # Save contrastive results
     cres.to_csv(os.path.join(args.out, f'contrastive_results_{args.sample_id}.csv'), index=False)
     torch.save(cres, os.path.join(args.out, f'contrastive_results_{args.sample_id}.pt')) 
+
+    # Save out_dict with trajectory predictions and metadata
+    out_dict = {
+        'xt_hat_1': xt_hat_1.detach().cpu().numpy(),
+        'xt_hat_2': xt_hat_2.detach().cpu().numpy(),
+        'x1_observed': x1.detach().cpu().numpy(),
+        'x2_observed': x2.detach().cpu().numpy(),
+        'target_gene': args.target_gene,
+        'target_gene_output_ix': args.target_gene_output_ix,
+        'cell_line_1': args.cell_line_1,
+        'cell_line_2': args.cell_line_2,
+        'pert_id': args.pert_id,
+        'dose': args.dose,
+        'horizon': args.horizon,
+        'n_time_pts': args.n_time_pts,
+        't': args.t.cpu().numpy(),
+    }
+    torch.save(out_dict, os.path.join(args.out, f'out_dict_{args.sample_id}.pt'))
 
     print(f'Contrastive explanation results saved to {args.out}')
     print('--'*40)
