@@ -251,12 +251,12 @@ if __name__ == '__main__':
 
     cres = run_contrastive_explanation(args, x1, x2, xt_hat_w_inputs_1, xt_hat_w_inputs_2, args.target_gene_output_ix)
 
-    # Save contrastive results
+    # Save contrastive results as CSV
     cres.to_csv(os.path.join(args.out, f'contrastive_results_{args.sample_id}.csv'), index=False)
-    torch.save(cres, os.path.join(args.out, f'contrastive_results_{args.sample_id}.pt')) 
 
-    # Save out_dict with trajectory predictions and metadata
+    # Save out_dict with cres, trajectory predictions and metadata
     out_dict = {
+        'cres': cres,
         'xt_hat_1': xt_hat_1.detach().cpu().numpy(),
         'xt_hat_2': xt_hat_2.detach().cpu().numpy(),
         'x1_observed': x1.detach().cpu().numpy(),
@@ -271,7 +271,7 @@ if __name__ == '__main__':
         'n_time_pts': args.n_time_pts,
         't': args.t.cpu().numpy(),
     }
-    torch.save(out_dict, os.path.join(args.out, f'out_dict_{args.sample_id}.pt'))
+    torch.save(out_dict, os.path.join(args.out, f'contrastive_results_{args.sample_id}.pt'))
 
     print(f'Contrastive explanation results saved to {args.out}')
     print('--'*40)

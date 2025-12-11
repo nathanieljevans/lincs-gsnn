@@ -45,8 +45,8 @@ def load_cres(sample_dir, sample_id):
 
 
 def load_out_dict(sample_dir, sample_id):
-    """Load out_dict for a sample."""
-    pt_path = os.path.join(sample_dir, f'out_dict_{sample_id}.pt')
+    """Load out_dict (contrastive_results .pt file) for a sample."""
+    pt_path = os.path.join(sample_dir, f'contrastive_results_{sample_id}.pt')
     if os.path.exists(pt_path):
         return torch.load(pt_path, weights_only=False)
     return None
