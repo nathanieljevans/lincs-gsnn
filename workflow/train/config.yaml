@@ -20,7 +20,7 @@ make_bio_network:
   include_extra:    '' #'--include_extra'
   dorothea_levels:  'ABC' 
   max_dti_kd:       1000.0
-  filter_depth:     10
+  filter_depth:     8
   remove_output_edges: '' # '--remove_output_edges' # '--remove_output_edges' to enable edge removal
   n_edges_to_remove: 0
   seed: 0
@@ -28,16 +28,16 @@ make_bio_network:
 pretrain: 
   batch_size: 256
   num_workers: 16 
-  epochs: 50
+  epochs: 15
   lr: 5e-4
   wd: 0
   init: 'degree_normalized'
-  patience: 25
+  patience: 3
   channels: 4
-  layers: 10
+  layers: 8
   share_layers: '' #--share_layers
   dropout: 0.0
-  norm: 'batch'
+  norm: 'softmax' # 'batch' 
   checkpoint: '--checkpoint'
 
 # Contrastive explanation for Palbociclib (CDK4/6 inhibitor) - RB1 response
