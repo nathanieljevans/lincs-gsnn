@@ -154,11 +154,6 @@ if __name__ == '__main__':
         merged_cres_path = os.path.join(args.out, f'{args.name}_cres.csv')
         merged_cres.to_csv(merged_cres_path, index=False)
         print(f'Saved merged cres to {merged_cres_path}')
-        
-        # Also save as parquet for efficiency
-        merged_cres_parquet = os.path.join(args.out, f'{args.name}_cres.parquet')
-        merged_cres.to_parquet(merged_cres_parquet, index=False)
-        print(f'Saved merged cres to {merged_cres_parquet}')
     else:
         print('WARNING: No cres DataFrames to merge')
 

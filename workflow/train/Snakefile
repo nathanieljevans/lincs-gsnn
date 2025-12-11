@@ -200,7 +200,6 @@ rule aggregate_contrastive_palbociclib_rb1:
         pts = expand(os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "{sample}", "contrastive_results_{sample}.pt"), sample=SAMPLES),
     output:
         cres_csv = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_cres.csv"),
-        cres_parquet = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_cres.parquet"),
         out_dict = os.path.join(CONTRASTIVE_PALBOCICLIB_RB1_DIR, "aggregated_out_dict.pt"),
     params:
         script = cfg['scripts']["aggregate_contrastive"],
