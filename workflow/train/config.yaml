@@ -1,5 +1,5 @@
 run_id: all_edges_included_02
-# no weight decay or dropout but smaller model dim
+# no weight decay or dropout but smaller model dim + deeper model (6-> 10 layers)
 
 dirs:
   data: /home/exacloud/gscratch/mcweeney_lab/evans/data    
@@ -20,7 +20,7 @@ make_bio_network:
   include_extra:    '' #'--include_extra'
   dorothea_levels:  'ABC' 
   max_dti_kd:       1000.0
-  filter_depth:     5
+  filter_depth:     10
   remove_output_edges: '' # '--remove_output_edges' # '--remove_output_edges' to enable edge removal
   n_edges_to_remove: 0
   seed: 0
@@ -34,7 +34,7 @@ pretrain:
   init: 'degree_normalized'
   patience: 25
   channels: 4
-  layers: 6
+  layers: 10
   share_layers: '' #--share_layers
   dropout: 0.0
   norm: 'batch'
