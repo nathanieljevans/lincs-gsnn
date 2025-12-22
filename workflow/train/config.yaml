@@ -1,5 +1,4 @@
-run_id: all_edges_included_02
-# no weight decay or dropout but smaller model dim + deeper model (6-> 10 layers)
+run_id: all_edges_no_mirna_01
 
 dirs:
   data: /home/exacloud/gscratch/mcweeney_lab/evans/data    
@@ -16,7 +15,7 @@ scripts:
   aggregate_contrastive: ../scripts/aggregate_contrastive_results.py
 
 make_bio_network: 
-  include_mirna:    '--include_mirna'
+  include_mirna:    ''
   include_extra:    '' #'--include_extra'
   dorothea_levels:  'ABC' 
   max_dti_kd:       1000.0
@@ -29,15 +28,15 @@ pretrain:
   batch_size: 256
   num_workers: 16 
   epochs: 20
-  lr: 5e-4
+  lr: 1e-3
   wd: 0
   init: 'degree_normalized'
   patience: 3
   channels: 4
   layers: 8
-  share_layers: '--share_layers' #--share_layers
-  dropout: 0.0
-  norm: 'softmax' # 'batch' 
+  share_layers: '' #--share_layers
+  dropout: 0.25
+  norm: 'batch' # 'batch' 
   checkpoint: '--checkpoint'
 
 # Contrastive explanation for Palbociclib (CDK4/6 inhibitor) - RB1 response
