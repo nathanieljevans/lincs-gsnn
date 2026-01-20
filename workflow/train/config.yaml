@@ -25,16 +25,16 @@ make_bio_network:
   seed: 0
   
 pretrain: 
-  batch_size: 512
+  batch_size: 128
   num_workers: 16 
   epochs: 20
   lr: 1e-3
-  wd: 1e-4
+  wd: 0
   init: 'degree_normalized'
   patience: 3
-  channels: 10
+  channels: 3
   layers: 8
-  share_layers: '--share_layers'
+  share_layers: ''
   dropout: 0.
   norm: 'batch' # 'batch' 
   checkpoint: '--checkpoint'
