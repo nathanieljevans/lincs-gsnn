@@ -15,9 +15,9 @@ scripts:
   aggregate_contrastive: ../scripts/aggregate_contrastive_results.py
 
 make_bio_network: 
-  include_mirna:    ''
+  include_mirna:    '--include_mirna' # '--include_mirna'
   include_extra:    '' #'--include_extra'
-  dorothea_levels:  'ABC' 
+  dorothea_levels:  'AB' 
   max_dti_kd:       1000.0
   filter_depth:     8
   remove_output_edges: '' # '--remove_output_edges' # '--remove_output_edges' to enable edge removal
@@ -25,42 +25,20 @@ make_bio_network:
   seed: 0
   
 pretrain: 
-  batch_size: 256
+  batch_size: 512
   num_workers: 16 
   epochs: 20
   lr: 1e-3
-  wd: 0
+  wd: 1e-4
   init: 'degree_normalized'
   patience: 3
-  channels: 4
+  channels: 10
   layers: 8
-  share_layers: '' #--share_layers
-  dropout: 0.25
+  share_layers: '--share_layers'
+  dropout: 0.
   norm: 'batch' # 'batch' 
   checkpoint: '--checkpoint'
 
-# Contrastive explanation for Palbociclib (CDK4/6 inhibitor) - RB1 response
-# Compares MCF7 (RB1-proficient) vs MDAMB468 (RB1-deficient) cell lines
-contrastive_explanation_palbociclib_rb1:
-  output_dir: contrastive_explanation_palbociclib_rb1
-  target_gene: 'CCNE2'
-  cell_line_1: 'MCF7'
-  cell_line_2: 'MDAMB468'
-  pert_id: 'BRD-K51313569' # Palbociclib
-  dose: 10.0
-  horizon: 72
-  n_time_pts: 25
-  method: 'euler'
-  tol: 1e-4
-  hard: ''  # empty for False, '--hard' for True
-  beta: 5e-4
-  lr: 5e-2
-  prior: 5
-  iters: 500
-  entropy: 1.0
-  grad_norm_clip: 1.0
-  free_edges: 100
-  explanation_target: 'edge'
 
 # Contrastive explanation for Trametinib (MEK inhibitor) - MAPK response
 # Compares MDAMB231 (RAS-mutant, MAPK-addicted) vs MCF7 (PIK3CA-mutant, MAPK-independent)
