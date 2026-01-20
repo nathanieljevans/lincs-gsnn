@@ -27,12 +27,12 @@ make_bio_network:
 pretrain: 
   batch_size: 128
   num_workers: 16 
-  epochs: 20
-  lr: 1e-3
+  epochs: 30
+  lr: 1e-2
   wd: 0
   init: 'degree_normalized'
   patience: 3
-  channels: 3
+  channels: 5
   layers: 8
   share_layers: ''
   dropout: 0.
