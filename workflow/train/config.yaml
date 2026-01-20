@@ -1,4 +1,4 @@
-run_id: all_edges_no_mirna_01
+run_id: all_edges_hi_conf_network_01
 
 dirs:
   data: /home/exacloud/gscratch/mcweeney_lab/evans/data    
