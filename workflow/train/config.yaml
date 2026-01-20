@@ -84,3 +84,25 @@ contrastive_explanation_trametinib_mapk:
   grad_norm_clip: 1.0
   free_edges: 100
   explanation_target: 'edge'
+
+
+contrastive_explanation_trametinib_mapk_node_target:
+  output_dir: contrastive_explanation_trametinib_mapk_node_target
+  target_gene: 'DUSP6'
+  cell_line_1: 'MDAMB231'
+  cell_line_2: 'MCF7'
+  pert_id: 'BRD-K12343256' # Trametinib
+  dose: 10.0
+  horizon: 72
+  n_time_pts: 25
+  method: 'euler'
+  tol: 1e-4
+  hard: ''  # empty for False, '--hard' for True
+  beta: 5e-4
+  lr: 5e-2
+  prior: 5
+  iters: 250
+  entropy: 1.0
+  grad_norm_clip: 1.0
+  free_edges: 100
+  explanation_target: 'node'
