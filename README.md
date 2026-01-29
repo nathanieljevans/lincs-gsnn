@@ -59,6 +59,11 @@ Note that this project is dependent on data generated from the `lincs-traj` work
 
 6. Run workflows 
 
+```bash
+cd workflow/myworkflow/
+snakemake -j 1
+```
+
 ### Dependencies
 
 The project requires the following main packages (see `environment.yaml` for full list):
