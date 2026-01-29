@@ -45,12 +45,19 @@ conda activate lincs-gsnn
 pip install -e .
 ```
 
-4. Install HyperNet and GSNN packages: 
+4. Install GSNN packages: 
 
 ```bash 
 pip install git+https://github.com/nathanieljevans/GSNN
-pip install git+https://github.com/nathanieljevans/hypernet
 ```
+
+5. Download relevant data 
+
+See `data_availability.md` for data accessibility. Place the data in a `/data/` folder and update the relevant workflow paths. 
+
+Note that this project is dependent on data generated from the `lincs-traj` workflow, which can be found [here](https://github.com/nathanieljevans/DeepTraj). 
+
+6. Run workflows 
 
 ### Dependencies
 
@@ -65,5 +72,4 @@ The project requires the following main packages (see `environment.yaml` for ful
 
 Additionally, this project depends on:
 - [`gsnn`](https://github.com/nathanieljevans/gsnn) - Core GSNN model implementation
-- [`hypernet`](https://github.com/nathanieljevans/hypernet)
 - [`DeepTraj`](https://github.com/nathanieljevans/DeepTraj) - Data generation for input into this model. 
