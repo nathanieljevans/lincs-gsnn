@@ -1,6 +1,6 @@
 #!/bin/zsh
 #SBATCH --job-name=lincs-gsnn
-#SBATCH --time=36:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --partition=gpu
