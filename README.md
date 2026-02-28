@@ -1,5 +1,7 @@
 # LINCS-GSNN
 
+[![DOI](https://zenodo.org/badge/996983074.svg)](https://doi.org/10.5281/zenodo.18809217)  
+
 **Graph-Structured Neural Networks for Modeling Drug-Induced Gene Expression Dynamics**
 
 LINCS-GSNN is a computational framework that combines graph neural networks with ordinary differential equations (ODEs) to model and explain drug-induced transcriptional responses. By embedding biological network structure directly into the neural architecture, LINCS-GSNN enables mechanistic interpretation of drug effects through biologically meaningful pathways.
