@@ -1,3 +1,7 @@
+.cursor/ 
+.pytest_cache/
+.tmp_bionet_validate/ 
+.tmp_clustermap_test/
 /workflow/runs/
 *.snakemake/
 /notebooks/old/

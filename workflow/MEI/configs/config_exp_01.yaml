@@ -1,0 +1,147 @@
+run_id: mei_01
+
+# Optional Snakemake metadata directory (.snakemake/, locks, logs). When empty
+# (default), the workflow uses <dirs.runs>/<run_id>/.snakemake/ so parallel
+# runs with different run_id values do not contend on workflow/MEI/.snakemake/.
+snakemake_workdir: ''
+
+# Optional: cap how many trajectory samples the workflow uses. When unset (or
+# null), all discovered `sample_*` directories under `dirs.preds` are used.
+run_n_samples: 1
+
+dirs:
+  data: /home/exacloud/gscratch/mcweeney_lab/evans/data
+  extdata: ../extdata/
+  runs: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-gsnn
+  preds: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/exp/default_v03/output/predict_grid
+  bio_network: bionetwork
+  pretrain: pretrain
+  train: train
+
+scripts:
+  make_bio_network:        ../scripts/make_bio_network.py
+  pretrain:                ../scripts/pretrain_gsnn_with_dxdt.py
+  train:                   ../scripts/train_gsnn_with_odeint.py
+  infer_edges_mei:         ../scripts/infer_edges_mei.py
+  aggregate_mei:           ../scripts/aggregate_mei.py
+  eval_edge_predictions:   ../scripts/eval_edge_predictions.py
+  aggregate_eval_methods:  ../scripts/aggregate_eval_methods.py
+  baseline_kge:            ../scripts/baseline_kge.py
+  baseline_aracne:         ../scripts/baseline_aracne.py
+  baseline_corr:           ../scripts/baseline_corr.py
+  aggregate_baseline:      ../scripts/aggregate_baseline.py
+
+make_bio_network:
+  include_tf_mirna:       '--include_tf_mirna'
+  include_pathway_extra:  ''
+  include_kinase_extra:   ''
+  include_ligrec_extra:   ''
+  include_collecTRI:      ''
+  include_dorothea:       '--include_dorothea'
+  include_omnipath:       '--include_omnipath'
+  dorothea_levels:        'ABC'
+  complex_handling:       'link'
+  min_n_references:       null
+  min_curation_effort:    3
+  max_dti_kd:       100.0
+  filter_depth:     8
+  remove_output_edges: ''
+  n_edges_to_remove: 0
+  holdout_N_val_edges: 200
+  holdout_N_test_edges: 1000
+  seed: 0
+  val_cells_per_drug: 1
+  no_cell_line_edges: '--no_cell_line_edges'
+  include_gene_inputs: '--include_gene_inputs'
+  gene_stats: '/home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/proc/lincs-proc-v1/gene_stats.dict'
+
+pretrain:
+  batch_size: 256
+  num_workers: 4
+  epochs: 5
+  lr: 1e-2
+  wd: 1e-2
+  init: 'degree_normalized'
+  patience: 3
+  channels: 6
+  layers: 6
+  share_layers: ''
+  dropout: 0.05
+  norm: 'groupbatch'
+  checkpoint: ''
+  add_function_self_edges: '--add_function_self_edges'
+  bias:                    '--bias'
+  residual:                '--residual'
+  node_mlp:                '--no-node_mlp'
+  node_mlp_dim:            16
+  node_attn:               '--no-node_attn'
+  attn_mlp_hidden:         16
+  model:                   '--GSNN'
+  dxdt_nonlin:             leaky_relu
+  init_rna_half_life:      9.0
+  gamma_prior_weight:      1e-1
+
+train:
+  enabled:           false
+  batch_size:        16
+  num_workers:       4
+  epochs:            20
+  lr:                1e-2
+  wd:                1e-4
+  patience:          3
+  horizon:           20
+  multiple_shooting: ''
+  method:            'dopri5'
+  tol:               1e-2
+  gamma_prior_weight: 1e-1
+
+# MEI v1 does not support node_activity (see Snakefile guard).
+node_activity:
+  enabled: false
+
+mei:
+  reduction: 'l1'
+  score: 'corr'
+  layer_agg: 'max'
+  ridge: 1e-4
+  use_pre_norm: true
+  verbose: true
+  min_dose_um: 10     # keep rows with dose >= this (µM); null = no filter
+  subsample: 0.5        # fraction of dxdt_meta rows (1.0 = all; 0.1 = 10%)
+  subsample_seed: 0
+  batch_size: 512
+  num_workers: 4
+
+eval:
+  verbose: true
+  full_partition:
+    enabled: true
+    include_transcriptional: true   # op.interactions.Transcriptional() — meta TF->target (DorotheaABCD u CollecTRI u TFTarget)
+    include_collecTRI:       false  # standalone (subsumed by transcriptional)
+    include_dorothea:        false
+    dorothea_levels:         'ABCD'
+    include_omnipath:        true   # curated PROTEIN->PROTEIN PPI
+    include_pathway_extra:   true   # extra PPI w/o literature refs
+    include_kinase_extra:    true   # extra kinase-substrate
+    include_ligrec_extra:    true   # extra ligand-receptor
+    include_tf_mirna:        false  # TF->miRNA + miRNA->mRNA
+
+baselines:
+  kge:
+    enabled: false
+    hidden_channels: 256
+    lr: 1e-4
+    epochs: 1000
+    batch_size: 2048
+    seed: 42
+    # val edges come from bionetwork/removed_edges.csv (same split as MEI eval)
+  aracne:
+    enabled: false
+    aracne_jar: '/home/exacloud/gscratch/mcweeney_lab/evans/ARACNe-AP/dist/aracne.jar'
+    aracne_root: '/home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/aracne'
+    time_stride: 20
+    seed: 1
+  corr:
+    enabled: false
+    correlation: 'spearman'
+    dose: 10.0

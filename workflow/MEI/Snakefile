@@ -1,0 +1,741 @@
+import os
+import glob
+
+configfile: os.path.join(workflow.basedir, "config.yaml")
+cfg = config
+
+RUN_ID = cfg["run_id"]
+
+_sm_workdir = (cfg.get("snakemake_workdir") or "").strip()
+SNAKEMAKE_WORKDIR = _sm_workdir if _sm_workdir else os.path.join(cfg["dirs"]["runs"], RUN_ID, ".snakemake")
+workdir: SNAKEMAKE_WORKDIR
+print(f"Snakemake workdir: {SNAKEMAKE_WORKDIR}")
+
+
+def _snake_rel(path):
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(workflow.basedir, path))
+
+
+SCRIPTS = {k: _snake_rel(v) for k, v in cfg["scripts"].items()}
+EXTDATA = _snake_rel(cfg["dirs"]["extdata"])
+
+RUN_ROOT = os.path.join(cfg["dirs"]["runs"], RUN_ID)
+BIO_NET_DIR = os.path.join(RUN_ROOT, cfg["dirs"]["bio_network"])
+PRETRAIN_DIR = os.path.join(RUN_ROOT, cfg["dirs"]["pretrain"])
+INFER_EDGES_DIR = os.path.join(RUN_ROOT, "infer_edges")
+EVAL_DIR = os.path.join(RUN_ROOT, "inference_outputs")
+BASELINE_DIR = os.path.join(RUN_ROOT, "baselines")
+ROOT_TRAJ = cfg["dirs"]["preds"].replace("/predict_grid", "")
+
+GENE_NORM_PATH = os.path.join(BIO_NET_DIR, "gene_norm.pt")
+SPLIT_PATH = os.path.join(BIO_NET_DIR, "cell_drug_split.csv")
+REMOVED_EDGES_PATH = os.path.join(BIO_NET_DIR, "removed_edges.csv")
+
+HNET_CFG = cfg.get("hypernetwork", {}) or {}
+USE_HNET = bool(HNET_CFG.get("enabled", False))
+
+NA_CFG = cfg.get("node_activity", {}) or {}
+USE_NA = bool(NA_CFG.get("enabled", False))
+NA_PATH = NA_CFG.get("path", "") or os.path.join(BIO_NET_DIR, "node_activity.pt")
+
+TRAIN_CFG = cfg.get("train", {}) or {}
+USE_TRAIN = bool(TRAIN_CFG.get("enabled", False))
+TRAIN_DIR = os.path.join(RUN_ROOT, cfg["dirs"].get("train", "train"))
+PRETRAIN_CFG = cfg.get("pretrain", {}) or {}
+
+MEI_CFG = cfg.get("mei", {}) or {}
+EVAL_CFG = cfg.get("eval", {}) or {}
+BASELINES_CFG = cfg.get("baselines", {}) or {}
+KGE_CFG = BASELINES_CFG.get("kge", {}) or {}
+ARACNE_CFG = BASELINES_CFG.get("aracne", {}) or {}
+CORR_CFG = BASELINES_CFG.get("corr", {}) or {}
+USE_KGE = bool(KGE_CFG.get("enabled", False))
+USE_ARACNE = bool(ARACNE_CFG.get("enabled", False))
+USE_CORR = bool(CORR_CFG.get("enabled", False))
+
+if USE_NA and USE_HNET:
+    raise ValueError(
+        "config.yaml: node_activity.enabled and hypernetwork.enabled are mutually exclusive."
+    )
+
+if USE_NA:
+    raise ValueError(
+        "config.yaml: MEI workflow v1 does not support node_activity.enabled=true "
+        "(MagnitudeEdgeInferer requires model(x) without x_fn). Disable node_activity."
+    )
+
+if USE_TRAIN and USE_HNET:
+    raise ValueError(
+        "config.yaml: train.enabled and hypernetwork.enabled are mutually exclusive in v1."
+    )
+
+
+def _hnet_train_args():
+    if not USE_HNET:
+        return ""
+    parts = ["--use_hypernetwork"]
+    parts.append(f"--hnet_stochastic_channels {int(HNET_CFG.get('stochastic_channels', 4))}")
+    parts.append(f"--hnet_width {int(HNET_CFG.get('width', 8))}")
+    parts.append(f"--hnet_pz {HNET_CFG.get('pz', 'normal')}")
+    if bool(HNET_CFG.get("learn_pz", False)):
+        parts.append("--hnet_learn_pz")
+    if bool(HNET_CFG.get("affine", False)):
+        parts.append("--hnet_affine")
+    parts.append(f"--hnet_norm {HNET_CFG.get('norm', 'none')}")
+    parts.append(f"--hnet_dropout {float(HNET_CFG.get('dropout', 0.0))}")
+    if bool(HNET_CFG.get("bias", False)):
+        parts.append("--hnet_bias")
+    parts.append(f"--hnet_embed_dim {int(HNET_CFG.get('embed_dim', 0))}")
+    parts.append(f"--hnet_n_train_samples {int(HNET_CFG.get('n_train_samples', 1))}")
+    parts.append(f"--hnet_loss {HNET_CFG.get('loss', 'mse')}")
+    if bool(HNET_CFG.get("pretrain_init", False)):
+        parts.append("--hnet_pretrain_init")
+    return " ".join(parts)
+
+
+def _bio_filter_args():
+    mbn = cfg.get("make_bio_network", {}) or {}
+    parts = []
+    min_refs = mbn.get("min_n_references")
+    if min_refs is not None:
+        parts.append(f"--min_n_references {int(min_refs)}")
+    min_curation = mbn.get("min_curation_effort")
+    if min_curation is not None:
+        parts.append(f"--min_curation_effort {int(min_curation)}")
+    return " ".join(parts)
+
+
+def _na_make_bio_network_args():
+    if not USE_NA:
+        return ""
+    parts = ["--node_activity"]
+    parts.append(f"--node_activity_eps {float(NA_CFG.get('eps', 1e-6))}")
+    feats = NA_CFG.get("features", ["expr"]) or ["expr"]
+    if isinstance(feats, str):
+        feats = [feats]
+    parts.append("--node_activity_features " + " ".join(str(f) for f in feats))
+    return " ".join(parts)
+
+
+def _na_pretrain_args():
+    if not USE_NA:
+        return ""
+    parts = ["--node_activity"]
+    parts.append(f"--node_activity_path {NA_PATH}")
+    parts.append(f"--node_activity_hidden {int(NA_CFG.get('hidden_dim', 16))}")
+    parts.append(f"--node_activity_temperature {float(NA_CFG.get('temperature', 1.0))}")
+    parts.append(f"--node_activity_dropout {float(NA_CFG.get('dropout', 0.0))}")
+    parts.append(f"--node_activity_mode {NA_CFG.get('mode', 'per-node')}")
+    parts.append(f"--alpha_decay {float(NA_CFG.get('alpha_decay', 1e-2))}")
+    return " ".join(parts)
+
+
+def _gamma_prior_pretrain_args():
+    parts = []
+    if PRETRAIN_CFG.get("init_rna_half_life") is not None:
+        parts.append(f"--init_rna_half_life {float(PRETRAIN_CFG['init_rna_half_life'])}")
+    if PRETRAIN_CFG.get("gamma_prior_weight") is not None:
+        parts.append(f"--gamma_prior_weight {float(PRETRAIN_CFG['gamma_prior_weight'])}")
+    return " ".join(parts)
+
+
+def _train_args():
+    if not USE_TRAIN:
+        return ""
+    parts = [
+        f"--epochs {int(TRAIN_CFG.get('epochs', 25))}",
+        f"--lr {float(TRAIN_CFG.get('lr', 1e-3))}",
+        f"--wd {float(TRAIN_CFG.get('wd', 1e-6))}",
+        f"--patience {int(TRAIN_CFG.get('patience', 3))}",
+        f"--batch_size {int(TRAIN_CFG.get('batch_size', 32))}",
+        f"--num_workers {int(TRAIN_CFG.get('num_workers', 4))}",
+        f"--horizon {int(TRAIN_CFG.get('horizon', 24))}",
+        f"--method {TRAIN_CFG.get('method', 'euler')}",
+        f"--tol {float(TRAIN_CFG.get('tol', 1e-4))}",
+    ]
+    if TRAIN_CFG.get("multiple_shooting"):
+        parts.append("--multiple_shooting")
+    if TRAIN_CFG.get("gamma_prior_weight") is not None:
+        parts.append(f"--gamma_prior_weight {float(TRAIN_CFG['gamma_prior_weight'])}")
+    return " ".join(parts)
+
+
+def _model_dir():
+    return TRAIN_DIR if USE_TRAIN else PRETRAIN_DIR
+
+
+def _model_name():
+    return "trained_model" if USE_TRAIN else "pretrained_model"
+
+
+def _mei_args():
+    parts = [
+        f"--reduction {MEI_CFG.get('reduction', 'l1')}",
+        f"--score {MEI_CFG.get('score', 'partial')}",
+        f"--layer_agg {MEI_CFG.get('layer_agg', 'mean')}",
+        f"--ridge {float(MEI_CFG.get('ridge', 1e-8))}",
+        f"--batch_size {int(MEI_CFG.get('batch_size', 128))}",
+        f"--num_workers {int(MEI_CFG.get('num_workers', 4))}",
+        f"--subsample {float(MEI_CFG.get('subsample', 1.0))}",
+        f"--subsample_seed {int(MEI_CFG.get('subsample_seed', 0))}",
+    ]
+    min_dose_um = MEI_CFG.get("min_dose_um")
+    if min_dose_um is not None:
+        parts.append(f"--min_dose_um {float(min_dose_um)}")
+    if bool(MEI_CFG.get("use_pre_norm", True)):
+        parts.append("--use_pre_norm")
+    else:
+        parts.append("--no-use_pre_norm")
+    if bool(MEI_CFG.get("verbose", True)):
+        parts.append("--verbose")
+    else:
+        parts.append("--no-verbose")
+    return " ".join(parts)
+
+
+def _eval_args():
+    if bool(EVAL_CFG.get("verbose", True)):
+        return "--verbose"
+    return "--no-verbose"
+
+
+def _full_partition_args():
+    fp = EVAL_CFG.get("full_partition", {}) or {}
+    if not bool(fp.get("enabled", False)):
+        return ""
+    parts = ["--full_partition"]
+    if bool(fp.get("include_transcriptional", False)):
+        parts.append("--full_include_transcriptional")
+    if bool(fp.get("include_collecTRI", False)):
+        parts.append("--full_include_collecTRI")
+    if bool(fp.get("include_dorothea", False)):
+        parts.append("--full_include_dorothea")
+    dorothea_levels = fp.get("dorothea_levels", "ABCD")
+    if dorothea_levels:
+        parts.append(f"--full_dorothea_levels {dorothea_levels}")
+    if bool(fp.get("include_omnipath", False)):
+        parts.append("--full_include_omnipath")
+    if bool(fp.get("include_pathway_extra", False)):
+        parts.append("--full_include_pathway_extra")
+    if bool(fp.get("include_kinase_extra", False)):
+        parts.append("--full_include_kinase_extra")
+    if bool(fp.get("include_ligrec_extra", False)):
+        parts.append("--full_include_ligrec_extra")
+    if bool(fp.get("include_tf_mirna", False)):
+        parts.append("--full_include_tf_mirna")
+    return " ".join(parts)
+
+
+os.makedirs(BIO_NET_DIR, exist_ok=True)
+os.makedirs(PRETRAIN_DIR, exist_ok=True)
+os.makedirs(INFER_EDGES_DIR, exist_ok=True)
+os.makedirs(EVAL_DIR, exist_ok=True)
+os.makedirs(BASELINE_DIR, exist_ok=True)
+if USE_TRAIN:
+    os.makedirs(TRAIN_DIR, exist_ok=True)
+
+wildcard_constraints:
+    sample = r"sample_[^/]+"
+
+PREDS_DIR = cfg["dirs"]["preds"]
+SAMPLES = sorted(
+    os.path.basename(p)
+    for p in glob.glob(os.path.join(PREDS_DIR, "sample_*"))
+    if os.path.isdir(p)
+)
+print(f"Found {len(SAMPLES)} samples on disk: {SAMPLES}")
+
+_run_n_samples = cfg.get("run_n_samples", None)
+if _run_n_samples is not None:
+    _n = max(0, min(int(_run_n_samples), len(SAMPLES)))
+    if _n < len(SAMPLES):
+        print(f"run_n_samples={_run_n_samples} -> using first {_n} of {len(SAMPLES)} samples")
+    SAMPLES = SAMPLES[:_n]
+print(f"Using {len(SAMPLES)} samples: {SAMPLES}")
+
+ENABLED_METHODS = ["mei"]
+if USE_KGE:
+    ENABLED_METHODS.append("kge")
+if USE_ARACNE:
+    ENABLED_METHODS.append("aracne")
+if USE_CORR:
+    ENABLED_METHODS.append("corr")
+
+
+rule all:
+    input:
+        os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        SPLIT_PATH,
+        GENE_NORM_PATH,
+        expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"), sample=SAMPLES),
+        (expand(os.path.join(TRAIN_DIR, "trained_model_{sample}.pt"), sample=SAMPLES) if USE_TRAIN else []),
+        (expand(os.path.join(PRETRAIN_DIR, "pretrained_hnet_{sample}.pt"), sample=SAMPLES) if USE_HNET else []),
+        expand(os.path.join(INFER_EDGES_DIR, "{sample}", "inferred_edges_test.csv"), sample=SAMPLES),
+        os.path.join(INFER_EDGES_DIR, "aggregated_predictions.csv"),
+        os.path.join(EVAL_DIR, "mei_evaluation_results.json"),
+        (os.path.join(BASELINE_DIR, "kge", "predictions.csv") if USE_KGE else []),
+        (os.path.join(EVAL_DIR, "kge_evaluation_results.json") if USE_KGE else []),
+        (expand(os.path.join(BASELINE_DIR, "aracne", "{sample}", "predictions.csv"), sample=SAMPLES) if USE_ARACNE else []),
+        (os.path.join(BASELINE_DIR, "aracne", "aggregated_predictions.csv") if USE_ARACNE else []),
+        (os.path.join(EVAL_DIR, "aracne_evaluation_results.json") if USE_ARACNE else []),
+        (expand(os.path.join(BASELINE_DIR, "corr", "{sample}", "predictions.csv"), sample=SAMPLES) if USE_CORR else []),
+        (os.path.join(BASELINE_DIR, "corr", "aggregated_predictions.csv") if USE_CORR else []),
+        (os.path.join(EVAL_DIR, "corr_evaluation_results.json") if USE_CORR else []),
+        (os.path.join(EVAL_DIR, "methods_comparison.csv") if len(ENABLED_METHODS) > 1 else []),
+
+
+rule all_eval:
+    input:
+        os.path.join(EVAL_DIR, "methods_comparison.csv"),
+
+
+rule make_bio_network:
+    output:
+        net = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        cell_drug_split = SPLIT_PATH,
+        gene_norm = GENE_NORM_PATH,
+        removed_edges = REMOVED_EDGES_PATH,
+        **({"node_activity": NA_PATH} if USE_NA else {}),
+    params:
+        script = SCRIPTS["make_bio_network"],
+        data = cfg["dirs"]["data"],
+        extdata = EXTDATA,
+        meta = cfg["dirs"]["preds"],
+        out = BIO_NET_DIR,
+        include_tf_mirna = cfg["make_bio_network"].get("include_tf_mirna", ""),
+        include_pathway_extra = cfg["make_bio_network"].get("include_pathway_extra", ""),
+        include_kinase_extra = cfg["make_bio_network"].get("include_kinase_extra", ""),
+        include_ligrec_extra = cfg["make_bio_network"].get("include_ligrec_extra", ""),
+        include_collecTRI = cfg["make_bio_network"].get("include_collecTRI", ""),
+        include_dorothea = cfg["make_bio_network"].get("include_dorothea", ""),
+        include_omnipath = cfg["make_bio_network"].get("include_omnipath", ""),
+        dorothea_levels = cfg["make_bio_network"]["dorothea_levels"],
+        complex_handling = cfg["make_bio_network"].get("complex_handling", "link"),
+        bio_filter_args = _bio_filter_args(),
+        max_dti_kd = cfg["make_bio_network"]["max_dti_kd"],
+        filter_depth = cfg["make_bio_network"]["filter_depth"],
+        remove_output_edges = cfg["make_bio_network"]["remove_output_edges"],
+        n_edges_to_remove = cfg["make_bio_network"]["n_edges_to_remove"],
+        holdout_N_val_edges = cfg["make_bio_network"].get("holdout_N_val_edges", 0),
+        holdout_N_test_edges = cfg["make_bio_network"].get("holdout_N_test_edges", 0),
+        seed = cfg["make_bio_network"]["seed"],
+        val_cells_per_drug = cfg["make_bio_network"].get("val_cells_per_drug", 1),
+        no_cell_line_edges = cfg["make_bio_network"].get("no_cell_line_edges", ""),
+        include_gene_inputs = cfg["make_bio_network"].get("include_gene_inputs", ""),
+        gene_stats = cfg["make_bio_network"]["gene_stats"],
+        node_activity_args = _na_make_bio_network_args(),
+    shell:
+        """
+        python {params.script} \
+            --data {params.data} \
+            --out  {params.out} \
+            --extdata {params.extdata} \
+            --meta {params.meta} \
+            {params.include_tf_mirna} \
+            {params.include_pathway_extra} \
+            {params.include_kinase_extra} \
+            {params.include_ligrec_extra} \
+            {params.include_collecTRI} \
+            {params.include_dorothea} \
+            {params.include_omnipath} \
+            --dorothea_levels {params.dorothea_levels} \
+            --complex_handling {params.complex_handling} \
+            {params.bio_filter_args} \
+            --max_dti_kd {params.max_dti_kd} \
+            --filter_depth {params.filter_depth} \
+            {params.remove_output_edges} \
+            --n_edges_to_remove {params.n_edges_to_remove} \
+            --holdout_N_val_edges {params.holdout_N_val_edges} \
+            --holdout_N_test_edges {params.holdout_N_test_edges} \
+            --seed {params.seed} \
+            --val_cells_per_drug {params.val_cells_per_drug} \
+            {params.no_cell_line_edges} \
+            {params.include_gene_inputs} \
+            --gene_stats_path {params.gene_stats} \
+            {params.node_activity_args}
+        """
+
+
+rule pretrain_gsnn:
+    input:
+        bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        split = SPLIT_PATH,
+        gene_norm = GENE_NORM_PATH,
+        **({"node_activity": NA_PATH} if USE_NA else {}),
+        sample_obs = os.path.join(cfg["dirs"]["preds"], "{sample}", "obs"),
+        sample_dxdt = os.path.join(cfg["dirs"]["preds"], "{sample}", "dxdt"),
+    output:
+        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
+        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+        val_metrics = os.path.join(PRETRAIN_DIR, "val_metrics_pretrain_{sample}.json"),
+        **({"hnet": os.path.join(PRETRAIN_DIR, "pretrained_hnet_{sample}.pt")} if USE_HNET else {}),
+    params:
+        script = SCRIPTS["pretrain"],
+        data = cfg["dirs"]["preds"],
+        out = PRETRAIN_DIR,
+        batch_size = cfg["pretrain"]["batch_size"],
+        num_workers = cfg["pretrain"]["num_workers"],
+        epochs = cfg["pretrain"]["epochs"],
+        lr = cfg["pretrain"]["lr"],
+        wd = cfg["pretrain"]["wd"],
+        init = cfg["pretrain"]["init"],
+        patience = cfg["pretrain"]["patience"],
+        channels = cfg["pretrain"]["channels"],
+        layers = cfg["pretrain"]["layers"],
+        share_layers = cfg["pretrain"]["share_layers"],
+        dropout = cfg["pretrain"]["dropout"],
+        norm = cfg["pretrain"]["norm"],
+        checkpoint = cfg["pretrain"]["checkpoint"],
+        add_function_self_edges = cfg["pretrain"].get("add_function_self_edges", "--add_function_self_edges"),
+        bias = cfg["pretrain"].get("bias", "--bias"),
+        residual = cfg["pretrain"].get("residual", "--residual"),
+        node_mlp = cfg["pretrain"].get("node_mlp", "--node_mlp"),
+        node_mlp_dim = cfg["pretrain"].get("node_mlp_dim", 128),
+        node_attn = cfg["pretrain"].get("node_attn", "--no-node_attn"),
+        attn_mlp_hidden = cfg["pretrain"].get("attn_mlp_hidden", 32),
+        model = cfg["pretrain"].get("model", "--GSNN"),
+        dxdt_nonlin_arg = (f"--dxdt_nonlin {cfg['pretrain']['dxdt_nonlin']}" if cfg["pretrain"].get("dxdt_nonlin") else ""),
+        gamma_prior_args = _gamma_prior_pretrain_args(),
+        hnet_args = _hnet_train_args(),
+        node_activity_args = _na_pretrain_args(),
+    shell:
+        """
+        python {params.script} \
+            --data {params.data} \
+            --out {params.out} \
+            --bionet $(dirname {input.bionet}) \
+            --gene_norm_path {input.gene_norm} \
+            --split_path {input.split} \
+            --sample {wildcards.sample} \
+            --batch_size {params.batch_size} \
+            --num_workers {params.num_workers} \
+            --epochs {params.epochs} \
+            --lr {params.lr} \
+            --wd {params.wd} \
+            --init {params.init} \
+            --patience {params.patience} \
+            --channels {params.channels} \
+            --layers {params.layers} \
+            {params.share_layers} \
+            --dropout {params.dropout} \
+            --norm {params.norm} \
+            {params.checkpoint} \
+            {params.add_function_self_edges} \
+            {params.bias} \
+            {params.residual} \
+            {params.node_mlp} \
+            --node_mlp_dim {params.node_mlp_dim} \
+            {params.node_attn} \
+            --attn_mlp_hidden {params.attn_mlp_hidden} \
+            {params.model} \
+            {params.dxdt_nonlin_arg} \
+            {params.gamma_prior_args} \
+            {params.hnet_args} \
+            {params.node_activity_args}
+        """
+
+
+if USE_TRAIN:
+    rule train_gsnn:
+        input:
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+            split = SPLIT_PATH,
+            gene_norm = GENE_NORM_PATH,
+            pretrained = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
+            scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+            sample_obs = os.path.join(cfg["dirs"]["preds"], "{sample}", "obs"),
+            **({"node_activity": NA_PATH} if USE_NA else {}),
+        output:
+            model = os.path.join(TRAIN_DIR, "trained_model_{sample}.pt"),
+            val_metrics = os.path.join(TRAIN_DIR, "val_metrics_train_{sample}.json"),
+        params:
+            script = SCRIPTS["train"],
+            data = cfg["dirs"]["preds"],
+            out = TRAIN_DIR,
+            train_args = _train_args(),
+            node_activity_args = _na_pretrain_args(),
+        shell:
+            """
+            python {params.script} \
+                --data {params.data} \
+                --out  {params.out} \
+                --bionet $(dirname {input.bionet}) \
+                --gene_norm_path {input.gene_norm} \
+                --split_path {input.split} \
+                --pretrained_model {input.pretrained} \
+                --pretrained_scale {input.scale} \
+                --sample {wildcards.sample} \
+                {params.train_args} \
+                {params.node_activity_args}
+            """
+
+
+rule infer_edges_mei:
+    input:
+        bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        model = os.path.join(_model_dir(), f"{_model_name()}_{{sample}}.pt"),
+        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+    output:
+        csv = os.path.join(INFER_EDGES_DIR, "{sample}", "inferred_edges_test.csv"),
+    params:
+        script = SCRIPTS["infer_edges_mei"],
+        root_gsnn = RUN_ROOT,
+        root_traj = ROOT_TRAJ,
+        model_dir = _model_dir(),
+        model_name = _model_name(),
+        mei_args = _mei_args(),
+        out_dir = lambda w: os.path.join(INFER_EDGES_DIR, w.sample),
+    shell:
+        """
+        mkdir -p {params.out_dir}
+        python {params.script} \
+            --root_gsnn {params.root_gsnn} \
+            --root_traj {params.root_traj} \
+            --sample_id {wildcards.sample} \
+            --model_dir {params.model_dir} \
+            --model_name {params.model_name} \
+            --out {params.out_dir} \
+            {params.mei_args}
+        """
+
+
+rule aggregate_mei:
+    input:
+        expand(os.path.join(INFER_EDGES_DIR, "{sample}", "inferred_edges_test.csv"), sample=SAMPLES),
+    output:
+        csv = os.path.join(INFER_EDGES_DIR, "aggregated_predictions.csv"),
+    params:
+        script = SCRIPTS["aggregate_mei"],
+    shell:
+        """
+        python {params.script} \
+            --infer_edges_dir {INFER_EDGES_DIR} \
+            --out {output.csv}
+        """
+
+
+rule eval_mei:
+    input:
+        predictions = os.path.join(INFER_EDGES_DIR, "aggregated_predictions.csv"),
+        bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        removed_edges = REMOVED_EDGES_PATH,
+    output:
+        json = os.path.join(EVAL_DIR, "mei_evaluation_results.json"),
+    params:
+        script = SCRIPTS["eval_edge_predictions"],
+        eval_args = _eval_args(),
+        full_partition_args = _full_partition_args(),
+    shell:
+        """
+        python {params.script} \
+            --predictions_csv {input.predictions} \
+            --bionet {BIO_NET_DIR} \
+            --removed_edges {input.removed_edges} \
+            --out_dir {EVAL_DIR} \
+            --method_name mei \
+            --score_col score \
+            {params.eval_args} \
+            {params.full_partition_args}
+        """
+
+
+if USE_KGE:
+    rule baseline_kge:
+        input:
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+            removed_edges = REMOVED_EDGES_PATH,
+        output:
+            predictions = os.path.join(BASELINE_DIR, "kge", "predictions.csv"),
+        params:
+            script = SCRIPTS["baseline_kge"],
+            out_dir = os.path.join(BASELINE_DIR, "kge"),
+            hidden_channels = KGE_CFG.get("hidden_channels", 256),
+            lr = KGE_CFG.get("lr", 1e-4),
+            epochs = KGE_CFG.get("epochs", 1000),
+            batch_size = KGE_CFG.get("batch_size", 2048),
+            seed = KGE_CFG.get("seed", 42),
+        shell:
+            """
+            mkdir -p {params.out_dir}
+            python {params.script} \
+                --bionet {BIO_NET_DIR} \
+                --removed_edges {input.removed_edges} \
+                --out {params.out_dir} \
+                --hidden_channels {params.hidden_channels} \
+                --lr {params.lr} \
+                --epochs {params.epochs} \
+                --batch_size {params.batch_size} \
+                --seed {params.seed}
+            """
+
+    rule eval_kge:
+        input:
+            predictions = os.path.join(BASELINE_DIR, "kge", "predictions.csv"),
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+            removed_edges = REMOVED_EDGES_PATH,
+        output:
+            json = os.path.join(EVAL_DIR, "kge_evaluation_results.json"),
+        params:
+            script = SCRIPTS["eval_edge_predictions"],
+            eval_args = _eval_args(),
+            full_partition_args = _full_partition_args(),
+        shell:
+            """
+            python {params.script} \
+                --predictions_csv {input.predictions} \
+                --bionet {BIO_NET_DIR} \
+                --removed_edges {input.removed_edges} \
+                --out_dir {EVAL_DIR} \
+                --method_name kge \
+                --score_col score \
+                {params.eval_args} \
+                {params.full_partition_args}
+            """
+
+
+if USE_ARACNE:
+    rule baseline_aracne:
+        input:
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        output:
+            predictions = os.path.join(BASELINE_DIR, "aracne", "{sample}", "predictions.csv"),
+        params:
+            script = SCRIPTS["baseline_aracne"],
+            traj_dir = ROOT_TRAJ,
+            aracne_root = ARACNE_CFG.get("aracne_root", ""),
+            aracne_jar = ARACNE_CFG.get("aracne_jar", ""),
+            time_stride = ARACNE_CFG.get("time_stride", 20),
+            out_dir = lambda w: os.path.join(BASELINE_DIR, "aracne", w.sample),
+        shell:
+            """
+            mkdir -p {params.out_dir}
+            python {params.script} \
+                --sample_id {wildcards.sample} \
+                --traj_dir {params.traj_dir} \
+                --bionet {BIO_NET_DIR} \
+                --aracne_root {params.aracne_root} \
+                --aracne_jar {params.aracne_jar} \
+                --time_stride {params.time_stride} \
+                --out {params.out_dir}
+            """
+
+    rule aggregate_aracne:
+        input:
+            expand(os.path.join(BASELINE_DIR, "aracne", "{sample}", "predictions.csv"), sample=SAMPLES),
+        output:
+            csv = os.path.join(BASELINE_DIR, "aracne", "aggregated_predictions.csv"),
+        params:
+            script = SCRIPTS["aggregate_baseline"],
+        shell:
+            """
+            python {params.script} \
+                --input_dir {BASELINE_DIR}/aracne \
+                --out {output.csv}
+            """
+
+    rule eval_aracne:
+        input:
+            predictions = os.path.join(BASELINE_DIR, "aracne", "aggregated_predictions.csv"),
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+            removed_edges = REMOVED_EDGES_PATH,
+        output:
+            json = os.path.join(EVAL_DIR, "aracne_evaluation_results.json"),
+        params:
+            script = SCRIPTS["eval_edge_predictions"],
+            eval_args = _eval_args(),
+            full_partition_args = _full_partition_args(),
+        shell:
+            """
+            python {params.script} \
+                --predictions_csv {input.predictions} \
+                --bionet {BIO_NET_DIR} \
+                --removed_edges {input.removed_edges} \
+                --out_dir {EVAL_DIR} \
+                --method_name aracne \
+                --score_col score \
+                {params.eval_args} \
+                {params.full_partition_args}
+            """
+
+
+if USE_CORR:
+    rule baseline_corr:
+        input:
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        output:
+            predictions = os.path.join(BASELINE_DIR, "corr", "{sample}", "predictions.csv"),
+        params:
+            script = SCRIPTS["baseline_corr"],
+            traj_dir = ROOT_TRAJ,
+            correlation = CORR_CFG.get("correlation", "spearman"),
+            dose = CORR_CFG.get("dose", 10.0),
+            out_dir = lambda w: os.path.join(BASELINE_DIR, "corr", w.sample),
+        shell:
+            """
+            mkdir -p {params.out_dir}
+            python {params.script} \
+                --sample_id {wildcards.sample} \
+                --traj_dir {params.traj_dir} \
+                --bionet {BIO_NET_DIR} \
+                --correlation {params.correlation} \
+                --dose {params.dose} \
+                --out {params.out_dir}
+            """
+
+    rule aggregate_corr:
+        input:
+            expand(os.path.join(BASELINE_DIR, "corr", "{sample}", "predictions.csv"), sample=SAMPLES),
+        output:
+            csv = os.path.join(BASELINE_DIR, "corr", "aggregated_predictions.csv"),
+        params:
+            script = SCRIPTS["aggregate_baseline"],
+        shell:
+            """
+            python {params.script} \
+                --input_dir {BASELINE_DIR}/corr \
+                --out {output.csv}
+            """
+
+    rule eval_corr:
+        input:
+            predictions = os.path.join(BASELINE_DIR, "corr", "aggregated_predictions.csv"),
+            bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+            removed_edges = REMOVED_EDGES_PATH,
+        output:
+            json = os.path.join(EVAL_DIR, "corr_evaluation_results.json"),
+        params:
+            script = SCRIPTS["eval_edge_predictions"],
+            eval_args = _eval_args(),
+            full_partition_args = _full_partition_args(),
+        shell:
+            """
+            python {params.script} \
+                --predictions_csv {input.predictions} \
+                --bionet {BIO_NET_DIR} \
+                --removed_edges {input.removed_edges} \
+                --out_dir {EVAL_DIR} \
+                --method_name corr \
+                --score_col score \
+                {params.eval_args} \
+                {params.full_partition_args}
+            """
+
+
+if len(ENABLED_METHODS) > 1:
+    rule eval_all_methods:
+        input:
+            expand(os.path.join(EVAL_DIR, "{method}_evaluation_results.json"), method=ENABLED_METHODS),
+        output:
+            csv = os.path.join(EVAL_DIR, "methods_comparison.csv"),
+        params:
+            script = SCRIPTS["aggregate_eval_methods"],
+        shell:
+            """
+            python {params.script} \
+                --eval_dir {EVAL_DIR} \
+                --out {output.csv}
+            """

@@ -1,0 +1,136 @@
+run_id: fei_01
+
+# Optional Snakemake metadata directory (.snakemake/, locks, logs). When empty
+# (default), the workflow uses <dirs.runs>/<run_id>/.snakemake/ so parallel
+# runs with different run_id values do not contend on workflow/FEI/.snakemake/.
+snakemake_workdir: ''
+
+# Optional: cap how many trajectory samples the workflow uses. When unset (or
+# null), all discovered `sample_*` directories under `dirs.preds` are used.
+run_n_samples: 1
+
+dirs:
+  data: /home/exacloud/gscratch/mcweeney_lab/evans/data
+  extdata: ../extdata/
+  runs: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-gsnn
+  preds: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/exp/default_v03/output/predict_grid
+  bio_network: bionetwork
+  pretrain: pretrain
+
+scripts:
+  make_bio_network:        ../scripts/make_bio_network.py
+  pretrain_fei:            ../scripts/pretrain_gsnn_with_fei.py
+  infer_edges_fei:         ../scripts/infer_edges_fei.py
+  aggregate_fei:           ../scripts/aggregate_fei.py
+  eval_edge_predictions:   ../scripts/eval_edge_predictions.py
+  aggregate_eval_methods:  ../scripts/aggregate_eval_methods.py
+  baseline_kge:            ../scripts/baseline_kge.py
+  baseline_aracne:         ../scripts/baseline_aracne.py
+  baseline_corr:           ../scripts/baseline_corr.py
+  aggregate_baseline:      ../scripts/aggregate_baseline.py
+
+make_bio_network:
+  include_tf_mirna:       '--include_tf_mirna'
+  include_pathway_extra:  ''
+  include_kinase_extra:   ''
+  include_ligrec_extra:   ''
+  include_collecTRI:      ''
+  include_dorothea:       '--include_dorothea'
+  include_omnipath:       '--include_omnipath'
+  dorothea_levels:        'AB'
+  complex_handling:       'link'
+  min_n_references:       null
+  min_curation_effort:    3
+  max_dti_kd:       100.0
+  filter_depth:     8
+  remove_output_edges: ''
+  n_edges_to_remove: 0
+  holdout_N_val_edges: 2500
+  holdout_N_test_edges: 2500
+  seed: 0
+  val_cells_per_drug: 1
+  no_cell_line_edges: '--no_cell_line_edges'
+  include_gene_inputs: '--include_gene_inputs'
+  gene_stats: '/home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/proc/lincs-proc-v1/gene_stats.dict'
+
+pretrain:
+  batch_size: 256
+  num_workers: 4
+  epochs: 5
+  lr: 1e-2
+  wd: 1e-2
+  init: 'degree_normalized'
+  patience: 3
+  channels: 4
+  layers: 6
+  share_layers: ''
+  dropout: 0.05
+  norm: 'none'
+  checkpoint: ''
+  add_function_self_edges: '--add_function_self_edges'
+  bias:                    '--bias'
+  residual:                '--residual'
+  node_mlp:                '--no-node_mlp'
+  node_mlp_dim:            16
+  node_attn:               '--no-node_attn'
+  attn_mlp_hidden:         16
+  model:                   '--BIOGSNN'
+  dxdt_nonlin:             leaky_relu
+  init_rna_half_life:      9.0
+  gamma_prior_weight:      1e-1
+
+# FEI v1 does not support node_activity (see Snakefile guard).
+node_activity:
+  enabled: false
+
+fei:
+  score_method:       'spearman'
+  norm:               'l1'
+  agg:                'sum'
+  use_pre_norm:       true
+  penalty_factor:     0.0
+  scale_by_act_mean:  true
+  estimate:           true
+  estimate_iters:       100
+  estimate_n_samples:   2500
+  row_chunk:          null
+  subsample:          1.
+  subsample_seed:     0
+  min_dose_um:        null
+  max_val_rows:       2500
+  select_metric:      'auroc'
+  select_freq:        1
+  verbose:            true
+
+eval:
+  verbose: true
+  full_partition:
+    enabled: true
+    include_transcriptional: true
+    include_collecTRI:       false
+    include_dorothea:        false
+    dorothea_levels:         'ABC'
+    include_omnipath:        true
+    include_pathway_extra:   true
+    include_kinase_extra:    true
+    include_ligrec_extra:    true
+    include_tf_mirna:        false
+
+baselines:
+  kge:
+    enabled: false
+    hidden_channels: 256
+    lr: 1e-4
+    epochs: 1000
+    batch_size: 2048
+    seed: 42
+  aracne:
+    enabled: false
+    aracne_jar: '/home/exacloud/gscratch/mcweeney_lab/evans/ARACNe-AP/dist/aracne.jar'
+    aracne_root: '/home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/aracne'
+    time_stride: 20
+    seed: 1
+  corr:
+    enabled: false
+    correlation: 'spearman'
+    dose: 10.0

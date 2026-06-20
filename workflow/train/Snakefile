@@ -1,50 +1,434 @@
 import os, datetime
 import yaml 
 import glob
+import json
+import re
 
 # ------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------
 
 
-configfile: "config.yaml"
+configfile: os.path.join(workflow.basedir, "config.yaml")
 cfg = config
 
 RUN_ID  = cfg["run_id"]
+N_MODELS = int(cfg.get("n_models", 1))
+BASE_SEED = int(cfg.get("base_seed", 0))
+SIGMA_FLOOR = float(cfg.get("sigma_floor", 1e-4))
 
-BIO_NET_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["bio_network"])
-PRETRAIN_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["pretrain"])
-CONTRASTIVE_TRAMETINIB_MAPK_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['contrastive_explanation_trametinib_mapk']["output_dir"])
-CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['contrastive_explanation_trametinib_mapk_node_target']["output_dir"])
+
+def _section_sigma_floor(section_cfg):
+    """Per-section sigma_floor with fallback to the top-level default.
+
+    Lets `pretrain:` and `train:` each set their own `sigma_floor` (e.g. to
+    re-tune the NLL variance floor for the train rule without re-running
+    pretrain). Falls back to the top-level `sigma_floor` when unset."""
+    val = (section_cfg or {}).get("sigma_floor")
+    return float(val) if val is not None else SIGMA_FLOOR
+
+# Per-run Snakemake metadata (.snakemake/, locks, logs) lives under the run
+# output tree so parallel invocations with different run_id values do not
+# contend on workflow/train/.snakemake/. Override via snakemake_workdir in
+# config when needed.
+_sm_workdir = (cfg.get("snakemake_workdir") or "").strip()
+SNAKEMAKE_WORKDIR = _sm_workdir if _sm_workdir else os.path.join(cfg["dirs"]["runs"], RUN_ID, ".snakemake")
+workdir: SNAKEMAKE_WORKDIR
+print(f"Snakemake workdir: {SNAKEMAKE_WORKDIR}")
+
+
+def _snake_rel(path):
+    """Resolve config paths relative to this Snakefile, not the run workdir."""
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    return os.path.normpath(os.path.join(workflow.basedir, path))
+
+
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in ('true', '1', 'yes'):
+        return True
+    if s in ('false', '0', 'no', ''):
+        return False
+    return bool(s)
+
+
+def _flag(name, v):
+    return f'--{name}' if _as_bool(v) else ''
+
+
+def _bool_opt(name, v):
+    return f'--{name}' if _as_bool(v) else f'--no-{name}'
+
+
+def _model_flag(v):
+    return '--BIOGSNN' if str(v).upper().endswith('BIOGSNN') else '--GSNN'
+
+
+def _pretrain_train_args(section_cfg):
+    """Render optimizer/amp/tf32/resume flags shared by pretrain and train rules."""
+    parts = [
+        f"--optimizer {section_cfg.get('optimizer', 'adamw')}",
+    ]
+    if _as_bool(section_cfg.get('amp')):
+        parts.append('--amp')
+    if _as_bool(section_cfg.get('grad_scaler')):
+        parts.append('--grad_scaler')
+    if _as_bool(section_cfg.get('torch32')):
+        parts.append('--tf32')
+    if _as_bool(section_cfg.get('resume_incomplete')):
+        parts.append('--resume_incomplete')
+    return ' '.join(parts)
+
+
+SCRIPTS = {k: _snake_rel(v) for k, v in cfg["scripts"].items()}
+EXTDATA = _snake_rel(cfg["dirs"]["extdata"])
+
+BIO_NET_DIR      = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["bio_network"])
+PRETRAIN_DIR     = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs']["pretrain"])
+CONTRASTIVE_ROOT = os.path.join(cfg['dirs']['runs'], RUN_ID)
+
+EXAMPLES               = cfg.get("contrastive_explanations", {})
+EXAMPLES_BY_OUTPUT_DIR = {v["output_dir"]: v for v in EXAMPLES.values()}
+OUTPUT_DIRS            = list(EXAMPLES_BY_OUTPUT_DIR.keys())
+
+# ----------------------------------------------------------------------------
+# Optional cell-line-conditioned hypernetwork. When `hypernetwork.enabled` is
+# False (default), every shell command below is byte-identical to the legacy
+# pipeline (i.e. no extra flags are passed and no extra artifacts are
+# produced).
+# ----------------------------------------------------------------------------
+HNET_CFG     = cfg.get("hypernetwork", {}) or {}
+USE_HNET     = bool(HNET_CFG.get("enabled", False))
+HNET_USE_EXP = bool(HNET_CFG.get("use_in_explanation", True))
+
+# ----------------------------------------------------------------------------
+# Optional per-function-node activity conditioning. Same pattern as
+# `hypernetwork`: when `node_activity.enabled` is False every shell command
+# is byte-identical to the legacy pipeline and `node_activity.pt` is not
+# produced. Mutually exclusive with the hypernetwork (the two mechanisms
+# both inject cell-line information via different code paths).
+# ----------------------------------------------------------------------------
+NA_CFG     = cfg.get("node_activity", {}) or {}
+USE_NA     = bool(NA_CFG.get("enabled", False))
+NA_PATH    = NA_CFG.get("path", "") or os.path.join(BIO_NET_DIR, "node_activity.pt")
+
+# ----------------------------------------------------------------------------
+# Per-gene control-population mu/sigma artifact, copied from lincs-traj's
+# gene_stats.dict into <bio_network>/gene_norm.pt by make_bio_network.py.
+# BIOGSNN requires this artifact for its log1p-back degradation term, so it is
+# unconditionally an input of every train rule and of `rule all`. The producer
+# rule is gated only on the `make_bio_network.gene_stats` config entry (a
+# missing entry will surface a friendly KeyError at Snakefile evaluation).
+# ----------------------------------------------------------------------------
+GENE_NORM_PATH = os.path.join(BIO_NET_DIR, "gene_norm.pt")
+SPLIT_PATH = os.path.join(BIO_NET_DIR, "cell_drug_split.csv")
+
+if USE_NA and USE_HNET:
+    raise ValueError(
+        "config.yaml: node_activity.enabled and hypernetwork.enabled are mutually "
+        "exclusive (both inject cell-line conditioning into the GSNN). "
+        "Disable one before running the workflow."
+    )
+
+# ----------------------------------------------------------------------------
+# Optional odeint fine-tune of the pretrained GSNN against observed
+# trajectories. When `train.enabled` is False (default), the workflow DAG and
+# every shell command rendered below are byte-identical to the pre-train-rule
+# pipeline. When True, a new `train_gsnn` rule runs after `pretrain_gsnn` and
+# downstream explain rules consume `trained_model_{model}.pt` instead of
+# `pretrained_model_{model}.pt`.
+# ----------------------------------------------------------------------------
+TRAIN_CFG = cfg.get("train", {}) or {}
+USE_TRAIN = bool(TRAIN_CFG.get("enabled", False))
+TRAIN_DIR = os.path.join(cfg['dirs']['runs'], RUN_ID, cfg['dirs'].get("train", "train"))
+PRETRAIN_CFG = cfg.get("pretrain", {}) or {}
+
+if USE_TRAIN and USE_HNET:
+    raise ValueError(
+        "config.yaml: train.enabled and hypernetwork.enabled are mutually "
+        "exclusive in v1 (the odeint fine-tune does not support hypernetwork-"
+        "conditioned models). Disable one before running the workflow."
+    )
+
+
+def _hnet_train_args():
+    """Render --hnet_* CLI flags from cfg['hypernetwork']. Returns the empty
+    string when hypernetwork is disabled so the shell command stays
+    byte-identical to the legacy invocation."""
+    if not USE_HNET:
+        return ""
+    parts = ["--use_hypernetwork"]
+    parts.append(f"--hnet_stochastic_channels {int(HNET_CFG.get('stochastic_channels', 4))}")
+    parts.append(f"--hnet_width {int(HNET_CFG.get('width', 8))}")
+    parts.append(f"--hnet_pz {HNET_CFG.get('pz', 'normal')}")
+    if bool(HNET_CFG.get("learn_pz", False)):
+        parts.append("--hnet_learn_pz")
+    if bool(HNET_CFG.get("affine", False)):
+        parts.append("--hnet_affine")
+    parts.append(f"--hnet_norm {HNET_CFG.get('norm', 'none')}")
+    parts.append(f"--hnet_dropout {float(HNET_CFG.get('dropout', 0.0))}")
+    if bool(HNET_CFG.get("bias", False)):
+        parts.append("--hnet_bias")
+    parts.append(f"--hnet_embed_dim {int(HNET_CFG.get('embed_dim', 0))}")
+    parts.append(f"--hnet_n_train_samples {int(HNET_CFG.get('n_train_samples', 1))}")
+    parts.append(f"--hnet_loss {HNET_CFG.get('loss', 'mse')}")
+    if bool(HNET_CFG.get("pretrain_init", False)):
+        parts.append("--hnet_pretrain_init")
+    return " ".join(parts)
+
+
+def _hnet_explain_arg():
+    """Render the --use_hypernetwork flag for explanation rules, gated on
+    BOTH `enabled` and `use_in_explanation`."""
+    return "--use_hypernetwork" if (USE_HNET and HNET_USE_EXP) else ""
+
+
+def _bio_filter_args():
+    """Render optional --min_n_references / --min_curation_effort flags for
+    make_bio_network. Returns the empty string when both are unset."""
+    mbn = cfg.get("make_bio_network", {}) or {}
+    parts = []
+    min_refs = mbn.get("min_n_references")
+    if min_refs is not None:
+        parts.append(f"--min_n_references {int(min_refs)}")
+    min_curation = mbn.get("min_curation_effort")
+    if min_curation is not None:
+        parts.append(f"--min_curation_effort {int(min_curation)}")
+    return " ".join(parts)
+
+
+def _na_make_bio_network_args():
+    """Render the --node_activity[_eps|_features] flags for make_bio_network.
+    Returns the empty string when node_activity is disabled so the legacy
+    bionetwork artifact is byte-identical to today."""
+    if not USE_NA:
+        return ""
+    parts = ["--node_activity"]
+    parts.append(f"--node_activity_eps {float(NA_CFG.get('eps', 1e-6))}")
+    feats = NA_CFG.get("features", ["expr"]) or ["expr"]
+    if isinstance(feats, str):
+        feats = [feats]
+    parts.append("--node_activity_features " + " ".join(str(f) for f in feats))
+    return " ".join(parts)
+
+
+def _simplify_function_graph_args():
+    """Render function-layer simplification flags for make_bio_network.
+    Returns the empty string when disabled (legacy bionetwork artifact unchanged)."""
+    mbn = cfg.get("make_bio_network", {}) or {}
+    fgs = mbn.get("function_graph_simplify", {}) or {}
+    if not fgs.get("enabled", False):
+        return ""
+    parts = []
+    d1 = fgs.get("degree_one", {}) or {}
+    if d1.get("enabled", False):
+        parts.append("--simplify_degree_one")
+        parts.append(f"--simplify_degree_one_in_degree {int(d1.get('in_degree', 1))}")
+        parts.append(f"--simplify_degree_one_out_degree {int(d1.get('out_degree', 1))}")
+    if fgs.get("check_reachability", False):
+        parts.append("--simplify_check_reachability")
+    return " ".join(parts)
+
+
+def _na_pretrain_args():
+    """Render the --node_activity[_*] flags for pretrain_gsnn. Empty when
+    node_activity is disabled."""
+    if not USE_NA:
+        return ""
+    parts = ["--node_activity"]
+    parts.append(f"--node_activity_path {NA_PATH}")
+    parts.append(f"--node_activity_hidden {int(NA_CFG.get('hidden_dim', 16))}")
+    parts.append(f"--node_activity_temperature {float(NA_CFG.get('temperature', 1.0))}")
+    parts.append(f"--node_activity_transform {NA_CFG.get('transform', 'sigmoid')}")
+    parts.append(f"--node_activity_mass {float(NA_CFG.get('mass', 1.0))}")
+    parts.append(f"--node_activity_dropout {float(NA_CFG.get('dropout', 0.0))}")
+    parts.append(f"--node_activity_mode {NA_CFG.get('mode', 'per-node')}")
+    # Train-time sparsity penalty on NodeActivity gate activations. Only
+    # rendered in node_activity mode so the legacy CLI stays byte-identical.
+    parts.append(f"--alpha_decay {float(NA_CFG.get('alpha_decay', 1e-2))}")
+    return " ".join(parts)
+
+
+def _gamma_prior_pretrain_args():
+    """Render BIOGSNN gamma-init / prior flags for pretrain_gsnn. Empty when
+    neither init_rna_half_life nor gamma_prior_weight is set in config."""
+    parts = []
+    if PRETRAIN_CFG.get("init_rna_half_life") is not None:
+        parts.append(f"--init_rna_half_life {float(PRETRAIN_CFG['init_rna_half_life'])}")
+    if PRETRAIN_CFG.get("gamma_prior_weight") is not None:
+        parts.append(f"--gamma_prior_weight {float(PRETRAIN_CFG['gamma_prior_weight'])}")
+    return " ".join(parts)
+
+
+def _na_explain_args():
+    """Render the --node_activity_path flag for explanation rules. Empty
+    when node_activity is disabled (the explanation scripts auto-detect via
+    model.node_activity, so the flag is only needed to override the default
+    path)."""
+    if not USE_NA:
+        return ""
+    return f"--node_activity_path {NA_PATH}"
+
+
+def _train_args():
+    """Render --epochs/--lr/... flags for the train_gsnn rule. Empty when
+    train is disabled (the rule is also gated out of the DAG in that case)."""
+    if not USE_TRAIN:
+        return ""
+    parts = [
+        f"--epochs {int(TRAIN_CFG.get('epochs', 25))}",
+        f"--lr {float(TRAIN_CFG.get('lr', 1e-3))}",
+        f"--wd {float(TRAIN_CFG.get('wd', 1e-6))}",
+        f"--patience {int(TRAIN_CFG.get('patience', 3))}",
+        f"--batch_size {int(TRAIN_CFG.get('batch_size', 32))}",
+        f"--num_workers {int(TRAIN_CFG.get('num_workers', 4))}",
+        f"--horizon {int(TRAIN_CFG.get('horizon', 24))}",
+        f"--method {TRAIN_CFG.get('method', 'euler')}",
+        f"--tol {float(TRAIN_CFG.get('tol', 1e-4))}",
+        f"--objective {TRAIN_CFG.get('objective', 'nll')}",
+        f"--clip_grad_norm {float(TRAIN_CFG.get('clip_grad_norm', 0.0))}",
+    ]
+    if _as_bool(TRAIN_CFG.get("adjoint")):
+        parts.append("--adjoint")
+    if _as_bool(TRAIN_CFG.get("multiple_shooting")):
+        parts.append("--multiple_shooting")
+    if TRAIN_CFG.get("gamma_prior_weight") is not None:
+        parts.append(f"--gamma_prior_weight {float(TRAIN_CFG['gamma_prior_weight'])}")
+    parts.append(_pretrain_train_args(TRAIN_CFG))
+    return " ".join(parts)
+
+
+def _model_seed(model_wildcard):
+    """Map model_k wildcard to replicate RNG seed."""
+    idx = int(str(model_wildcard).split("_", 1)[1])
+    return BASE_SEED + idx
+
+
+def _model_artifact(model):
+    """Return the on-disk path of the model artifact downstream explain rules
+    should consume for a given model wildcard. When train.enabled=true, this
+    is the odeint-fine-tuned model produced by rule train_gsnn; otherwise it
+    is the pretrained model produced by rule pretrain_gsnn."""
+    if USE_TRAIN:
+        return os.path.join(TRAIN_DIR, f"trained_model_{model}.pt")
+    return os.path.join(PRETRAIN_DIR, f"pretrained_model_{model}.pt")
+
+# Derive non-contrastive (example x cell_line) outputs from each contrastive
+# example. For each contrastive entry we produce two non-contrastive folders,
+# one per cell_line_1 / cell_line_2. Folder name:
+#   non_contrastive_explanation_<base>__<cell_line>/
+# where <base> is the contrastive output_dir with the leading
+# "contrastive_explanation_" stripped.
+NC_EXAMPLES_BY_OUTPUT_DIR = {}
+for _ex_key, _ex_cfg in EXAMPLES.items():
+    _base = _ex_cfg["output_dir"].replace(
+        "contrastive_explanation_", "non_contrastive_explanation_", 1)
+    for _cell_field in ("cell_line_1", "cell_line_2"):
+        _cell = _ex_cfg[_cell_field]
+        _nc_dir = f"{_base}__{_cell}"
+        NC_EXAMPLES_BY_OUTPUT_DIR[_nc_dir] = {**_ex_cfg, "cell_line": _cell}
+NC_OUTPUT_DIRS = list(NC_EXAMPLES_BY_OUTPUT_DIR.keys())
+
+# Examples with an optional ``eval:`` block (rule eval_explanation).
+EVAL_EXAMPLES = [k for k, v in EXAMPLES.items() if v.get("eval")]
+EVAL_DIR = os.path.join(CONTRASTIVE_ROOT, "eval")
+ROOT_TRAJ = cfg['dirs']["preds"].replace('/predict_grid', '')
+CONFIG_PATH = (
+    workflow.configfiles[0]
+    if getattr(workflow, "configfiles", None)
+    else os.path.join(workflow.basedir, "config.yaml")
+)
+
+def _ex_eval(w):
+    return EXAMPLES[w.example]
+
+def _nc_dir_for_example(output_dir, cell_line):
+    base = output_dir.replace("contrastive_explanation_", "non_contrastive_explanation_", 1)
+    return f"{base}__{cell_line}"
 
 os.makedirs(BIO_NET_DIR, exist_ok=True)
 os.makedirs(PRETRAIN_DIR, exist_ok=True)
-os.makedirs(CONTRASTIVE_TRAMETINIB_MAPK_DIR, exist_ok=True)
-os.makedirs(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, exist_ok=True)
+if USE_TRAIN:
+    os.makedirs(TRAIN_DIR, exist_ok=True)
+for _od in OUTPUT_DIRS:
+    os.makedirs(os.path.join(CONTRASTIVE_ROOT, _od), exist_ok=True)
+for _od in NC_OUTPUT_DIRS:
+    os.makedirs(os.path.join(CONTRASTIVE_ROOT, _od), exist_ok=True)
+if EVAL_EXAMPLES:
+    os.makedirs(EVAL_DIR, exist_ok=True)
 
-# Find all sample directories
-PREDS_DIR = cfg['dirs']["preds"]
-SAMPLES = [os.path.basename(p) for p in glob.glob(os.path.join(PREDS_DIR, "sample_*")) if os.path.isdir(p)]
-print(f"Found samples: {SAMPLES}")
+wildcard_constraints:
+    output_dir = r"(?:non_)?contrastive_explanation_[^/]+",
+    model      = r"model_[^/]+",
+    example    = "(" + "|".join(re.escape(e) for e in EVAL_EXAMPLES) + ")" if EVAL_EXAMPLES else r".^",
+
+# Model replicates: each model_k is trained on the same data with seed base_seed + k
+MODELS = [f"model_{i}" for i in range(N_MODELS)]
+print(f"Using {len(MODELS)} model replicates: {MODELS}")
 
 
 # ------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------
 rule all:
     input:
-        os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
-        expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"), sample=SAMPLES),
-        os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "aggregated_cres.csv"),
-        os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "aggregated_cres.csv"),
+        os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        SPLIT_PATH,
+        # gene_norm artifact: unconditional input. BIOGSNN's log1p-back
+        # degradation term requires it; make_bio_network.py writes it from
+        # cfg['make_bio_network']['gene_stats'].
+        GENE_NORM_PATH,
+        # node_activity artifact: only required when enabled; otherwise the
+        # list entry is empty and make_bio_network skips the build.
+        ([NA_PATH] if USE_NA else []),
+        expand(os.path.join(PRETRAIN_DIR, "pretrained_model_{model}.pt"), model=MODELS),
+        # The hypernetwork artifact is only required when use_hypernetwork is
+        # enabled in the config; otherwise this list is empty and pretrain_gsnn
+        # produces just the legacy artifact.
+        (expand(os.path.join(PRETRAIN_DIR, "pretrained_hnet_{model}.pt"), model=MODELS)
+         if USE_HNET else []),
+        # The odeint-fine-tuned model is only required when train.enabled=true.
+        # In that case downstream explain rules also switch to consuming it.
+        (expand(os.path.join(TRAIN_DIR, "trained_model_{model}.pt"), model=MODELS)
+         if USE_TRAIN else []),
+        expand(os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "aggregated_cres.csv"),
+               output_dir=OUTPUT_DIRS),
+        expand(os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "aggregated_cres.csv"),
+               output_dir=NC_OUTPUT_DIRS),
+        (expand(os.path.join(EVAL_DIR, "{example}.pt"), example=EVAL_EXAMPLES)
+         if EVAL_EXAMPLES else []),
+        ([os.path.join(EVAL_DIR, "eval_results.pt"),
+          os.path.join(EVAL_DIR, "eval_results.json"),
+          os.path.join(EVAL_DIR, "eval_results.csv"),
+          os.path.join(EVAL_DIR, "config.yaml")]
+         if EVAL_EXAMPLES else []),
 
-rule all_contrastive_trametinib_mapk:
-    '''Run contrastive explanation for Trametinib/MAPK for all samples'''
+rule all_eval:
+    '''Run explanation evaluation and aggregate into a single run-level report.'''
     input:
-        expand(os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
+        os.path.join(EVAL_DIR, "eval_results.pt"),
+        os.path.join(EVAL_DIR, "eval_results.json"),
+        os.path.join(EVAL_DIR, "eval_results.csv"),
+        os.path.join(EVAL_DIR, "config.yaml"),
 
-rule all_contrastive_trametinib_mapk_node_target:
-    '''Run contrastive explanation for Trametinib/MAPK (node target) for all samples'''
+rule all_contrastive:
+    '''Run contrastive explanation for all examples and all samples'''
     input:
-        expand(os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
+        expand(os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "{model}",
+                            "contrastive_results_{model}.csv"),
+               output_dir=OUTPUT_DIRS, model=MODELS),
+
+rule all_non_contrastive:
+    '''Run non-contrastive explanation for all examples, all cell lines, all samples.'''
+    input:
+        expand(os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "{model}",
+                            "non_contrastive_results_{model}.csv"),
+               output_dir=NC_OUTPUT_DIRS, model=MODELS),
 # ------------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------------
 
@@ -52,21 +436,49 @@ rule all_contrastive_trametinib_mapk_node_target:
 rule make_bio_network:
     ''''''
     output:
-        net = os.path.join(BIO_NET_DIR, f"bionetwork.pt")
+        net = os.path.join(BIO_NET_DIR, f"bionetwork.pt"),
+        cell_drug_split = SPLIT_PATH,
+        # gene_norm.pt: produced whenever cfg['make_bio_network']['gene_stats']
+        # resolves to a valid path (required by BIOGSNN).
+        gene_norm = GENE_NORM_PATH,
+        # node_activity.pt is only declared as an output when the user has
+        # enabled it; otherwise Snakemake does not expect it.
+        **({"node_activity": NA_PATH} if USE_NA else {}),
     params:
-        script = cfg['scripts']["make_bio_network"],
+        script = SCRIPTS["make_bio_network"],
         data = cfg['dirs']["data"],
-        extdata = cfg['dirs']["extdata"],
+        extdata = EXTDATA,
         meta = cfg['dirs']["preds"],
         out = BIO_NET_DIR,
-        include_mirna = cfg['make_bio_network']["include_mirna"],
-        include_extra = cfg['make_bio_network']["include_extra"],
+        include_tf_mirna = _flag('include_tf_mirna', cfg['make_bio_network'].get("include_tf_mirna", False)),
+        include_pathway_extra = _flag('include_pathway_extra', cfg['make_bio_network'].get("include_pathway_extra", False)),
+        include_kinase_extra = _flag('include_kinase_extra', cfg['make_bio_network'].get("include_kinase_extra", False)),
+        include_ligrec_extra = _flag('include_ligrec_extra', cfg['make_bio_network'].get("include_ligrec_extra", False)),
+        include_collecTRI = _flag('include_collecTRI', cfg['make_bio_network'].get("include_collecTRI", False)),
+        include_dorothea = _flag('include_dorothea', cfg['make_bio_network'].get("include_dorothea", False)),
+        include_omnipath = _flag('include_omnipath', cfg['make_bio_network'].get("include_omnipath", False)),
         dorothea_levels = cfg['make_bio_network']["dorothea_levels"],
+        complex_handling = cfg['make_bio_network'].get("complex_handling", 'link'),
+        bio_filter_args = _bio_filter_args(),
         max_dti_kd = cfg['make_bio_network']["max_dti_kd"],
         filter_depth = cfg['make_bio_network']["filter_depth"],
-        remove_output_edges = cfg['make_bio_network']["remove_output_edges"],
+        remove_output_edges = _flag('remove_output_edges', cfg['make_bio_network'].get("remove_output_edges", False)),
         n_edges_to_remove = cfg['make_bio_network']["n_edges_to_remove"],
         seed = cfg['make_bio_network']["seed"],
+        val_cells_per_drug = cfg['make_bio_network'].get("val_cells_per_drug", 1),
+        no_cell_line_edges = _flag('no_cell_line_edges', cfg['make_bio_network'].get("no_cell_line_edges", False)),
+        include_gene_inputs = _flag('include_gene_inputs', cfg['make_bio_network'].get("include_gene_inputs", False)),
+        no_uniprot_synonyms = _flag('no_uniprot_synonyms', cfg['make_bio_network'].get("no_uniprot_synonyms", False)),
+        gene_stats = cfg['make_bio_network']["gene_stats"],
+        cond_info = cfg['make_bio_network'].get(
+            "cond_info",
+            os.path.join(
+                os.path.dirname(cfg['make_bio_network']["gene_stats"]),
+                "cond_info.csv",
+            ),
+        ),
+        node_activity_args = _na_make_bio_network_args(),
+        simplify_args = _simplify_function_graph_args(),
 
     shell:
         """
@@ -75,26 +487,56 @@ rule make_bio_network:
             --out  {params.out} \
             --extdata {params.extdata} \
             --meta {params.meta} \
-            {params.include_mirna} \
-            {params.include_extra} \
+            {params.include_tf_mirna} \
+            {params.include_pathway_extra} \
+            {params.include_kinase_extra} \
+            {params.include_ligrec_extra} \
+            {params.include_collecTRI} \
+            {params.include_dorothea} \
+            {params.include_omnipath} \
             --dorothea_levels {params.dorothea_levels} \
+            --complex_handling {params.complex_handling} \
+            {params.bio_filter_args} \
             --max_dti_kd {params.max_dti_kd} \
             --filter_depth {params.filter_depth} \
             {params.remove_output_edges} \
             --n_edges_to_remove {params.n_edges_to_remove} \
-            --seed {params.seed}
+            --seed {params.seed} \
+            --val_cells_per_drug {params.val_cells_per_drug} \
+            {params.no_cell_line_edges} \
+            {params.include_gene_inputs} \
+            {params.no_uniprot_synonyms} \
+            --gene_stats_path {params.gene_stats} \
+            --cond_info_path {params.cond_info} \
+            {params.node_activity_args} \
+            {params.simplify_args}
         """
 
 rule pretrain_gsnn:
     input:
         bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
-        sample_obs = os.path.join(cfg['dirs']["preds"], "{sample}", "obs"),
-        sample_dxdt = os.path.join(cfg['dirs']["preds"], "{sample}", "dxdt"),
+        split = SPLIT_PATH,
+        # gene_norm artifact: unconditional input for BIOGSNN.
+        gene_norm = GENE_NORM_PATH,
+        # node_activity artifact is only declared as an input when enabled,
+        # so the legacy DAG is unchanged.
+        **({"node_activity": NA_PATH} if USE_NA else {}),
+        obs_npy = os.path.join(cfg['dirs']["preds"], "obs.npy"),
+        dxdt_npy = os.path.join(cfg['dirs']["preds"], "dxdt.npy"),
+        dxdt_meta = os.path.join(cfg['dirs']["preds"], "dxdt_meta.csv"),
+        gene_names = os.path.join(cfg['dirs']["preds"], "gene_names.csv"),
     output:
-        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
-        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+        # The legacy artifact is always produced; in hypernetwork mode it is
+        # the "mean cell line" GSNN materialized from the trained hnet.
+        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{model}.pt"),
+        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{model}.pt"),
+        val_metrics = os.path.join(PRETRAIN_DIR, "val_metrics_pretrain_{model}.json"),
+        # The hnet artifact is only declared as an output when the user has
+        # enabled hypernetwork training; otherwise it is omitted so Snakemake
+        # does not expect it.
+        **({"hnet": os.path.join(PRETRAIN_DIR, "pretrained_hnet_{model}.pt")} if USE_HNET else {}),
     params:
-        script = cfg['scripts']["pretrain"],
+        script = SCRIPTS["pretrain"],
         data = cfg['dirs']['preds'],
         out = PRETRAIN_DIR,
         batch_size = cfg['pretrain']["batch_size"],
@@ -106,10 +548,30 @@ rule pretrain_gsnn:
         patience = cfg['pretrain']["patience"],
         channels = cfg['pretrain']["channels"],
         layers = cfg['pretrain']["layers"],
-        share_layers = cfg['pretrain']["share_layers"],
+        share_layers = _flag('share_layers', cfg['pretrain'].get("share_layers", False)),
         dropout = cfg['pretrain']["dropout"],
         norm = cfg['pretrain']["norm"],
-        checkpoint = cfg['pretrain']["checkpoint"],
+        checkpoint = _flag('checkpoint', cfg['pretrain'].get("checkpoint", False)),
+        add_function_self_edges = _bool_opt('add_function_self_edges', cfg['pretrain'].get("add_function_self_edges", True)),
+        bias                    = _bool_opt('bias', cfg['pretrain'].get("bias", True)),
+        residual                = _bool_opt('residual', cfg['pretrain'].get("residual", True)),
+        node_mlp                = _bool_opt('node_mlp', cfg['pretrain'].get("node_mlp", True)),
+        node_mlp_dim            = cfg['pretrain'].get("node_mlp_dim", 128),
+        node_attn               = _bool_opt('node_attn', cfg['pretrain'].get("node_attn", False)),
+        attn_mlp_hidden         = cfg['pretrain'].get("attn_mlp_hidden", 32),
+        model                   = _model_flag(cfg['pretrain'].get("model", 'GSNN')),
+        objective               = cfg['pretrain'].get("objective", "nll"),
+        clip_grad_norm          = cfg['pretrain'].get("clip_grad_norm", 0.0),
+        dxdt_nonlin_arg         = (f"--dxdt_nonlin {cfg['pretrain']['dxdt_nonlin']}"
+                                   if cfg['pretrain'].get("dxdt_nonlin") else ""),
+        dxdt_clip_arg           = (f"--dxdt_clip {float(cfg['pretrain']['dxdt_clip'])}"
+                                   if cfg['pretrain'].get("dxdt_clip") else ""),
+        gamma_prior_args        = _gamma_prior_pretrain_args(),
+        hnet_args               = _hnet_train_args(),
+        node_activity_args      = _na_pretrain_args(),
+        pretrain_train_args     = _pretrain_train_args(PRETRAIN_CFG),
+        sigma_floor = _section_sigma_floor(PRETRAIN_CFG),
+        model_seed = lambda w: _model_seed(w.model),
 
     shell:
         """
@@ -117,7 +579,11 @@ rule pretrain_gsnn:
             --data {params.data} \
             --out {params.out} \
             --bionet $(dirname {input.bionet}) \
-            --sample {wildcards.sample} \
+            --gene_norm_path {input.gene_norm} \
+            --split_path {input.split} \
+            --model_id {wildcards.model} \
+            --seed {params.model_seed} \
+            --sigma_floor {params.sigma_floor} \
             --batch_size {params.batch_size} \
             --num_workers {params.num_workers} \
             --epochs {params.epochs} \
@@ -130,52 +596,129 @@ rule pretrain_gsnn:
             {params.share_layers} \
             --dropout {params.dropout} \
             --norm {params.norm} \
-            {params.checkpoint}
+            {params.checkpoint} \
+            {params.add_function_self_edges} \
+            {params.bias} \
+            {params.residual} \
+            {params.node_mlp} \
+            --node_mlp_dim {params.node_mlp_dim} \
+            {params.node_attn} \
+            --attn_mlp_hidden {params.attn_mlp_hidden} \
+            {params.model} \
+            --objective {params.objective} \
+            --clip_grad_norm {params.clip_grad_norm} \
+            {params.dxdt_nonlin_arg} \
+            {params.dxdt_clip_arg} \
+            {params.gamma_prior_args} \
+            {params.hnet_args} \
+            {params.node_activity_args} \
+            {params.pretrain_train_args}
         """
 
-rule contrastive_explanation_trametinib_mapk:
-    '''
-    Contrastive explanation for Trametinib (MEK inhibitor) - MAPK-addicted vs MAPK-independent response.
-    Compares MDAMB231 (RAS-mutant, MAPK-addicted) vs MCF7 (PIK3CA-mutant, MAPK-independent) cell lines.
-    Target gene: DUSP6 (ERK-feedback regulator gene).
-    '''
+
+rule train_gsnn:
+    """Optional odeint fine-tune of the pretrained GSNN against observed
+    trajectories. Only included in the DAG when `train.enabled=true`; downstream
+    explain rules then consume `trained_model_{model}.pt` via _model_artifact()."""
+    input:
+        bionet      = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        split       = SPLIT_PATH,
+        gene_norm   = GENE_NORM_PATH,
+        pretrained  = os.path.join(PRETRAIN_DIR, "pretrained_model_{model}.pt"),
+        scale       = os.path.join(PRETRAIN_DIR, "dxdt_scale_{model}.pt"),
+        obs_npy = os.path.join(cfg['dirs']["preds"], "obs.npy"),
+        pred_meta = os.path.join(cfg['dirs']["preds"], "pred_meta.csv"),
+        gene_names = os.path.join(cfg['dirs']["preds"], "gene_names.csv"),
+        # node_activity artifact: required only when enabled, so the legacy
+        # DAG stays unchanged.
+        **({"node_activity": NA_PATH} if USE_NA else {}),
+    output:
+        model = os.path.join(TRAIN_DIR, "trained_model_{model}.pt"),
+        val_metrics = os.path.join(TRAIN_DIR, "val_metrics_train_{model}.json"),
+    params:
+        script             = SCRIPTS["train"],
+        data               = cfg['dirs']['preds'],
+        out                = TRAIN_DIR,
+        train_args         = _train_args(),
+        sigma_floor        = _section_sigma_floor(TRAIN_CFG),
+        model_seed         = lambda w: _model_seed(w.model),
+        # Reuse the pretrain node_activity CLI helper: ODEFunc.set_x_fn needs
+        # the same per-cell lookup, and the unused hidden/temperature/dropout
+        # flags are accepted (and ignored) by the train script for CLI parity.
+        node_activity_args = _na_pretrain_args(),
+    shell:
+        """
+        python {params.script} \
+            --data {params.data} \
+            --out  {params.out} \
+            --bionet $(dirname {input.bionet}) \
+            --gene_norm_path {input.gene_norm} \
+            --split_path {input.split} \
+            --pretrained_model {input.pretrained} \
+            --pretrained_scale {input.scale} \
+            --model_id {wildcards.model} \
+            --seed {params.model_seed} \
+            --sigma_floor {params.sigma_floor} \
+            {params.train_args} \
+            {params.node_activity_args}
+        """
+
+
+def _ex(w):
+    return EXAMPLES_BY_OUTPUT_DIR[w.output_dir]
+
+rule contrastive_explanation:
+    '''Contrastive explanation for one (output_dir, sample) pair.'''
+    wildcard_constraints:
+        output_dir = r"contrastive_explanation_[^/]+",
     input:
         bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
-        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
-        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+        # Switches between pretrained_model and trained_model based on
+        # train.enabled; see _model_artifact() for the gating logic.
+        model  = lambda w: _model_artifact(w.model),
+        scale  = os.path.join(PRETRAIN_DIR, "dxdt_scale_{model}.pt"),
+        # Add the hnet artifact as a required input only in hypernetwork mode.
+        **({"hnet": os.path.join(PRETRAIN_DIR, "pretrained_hnet_{model}.pt")} if (USE_HNET and HNET_USE_EXP) else {}),
+        # Same for the node_activity artifact: required only when enabled.
+        **({"node_activity": NA_PATH} if USE_NA else {}),
     output:
-        csv = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "{sample}", "contrastive_results_{sample}.csv"),
-        pt = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "{sample}", "contrastive_results_{sample}.pt"),
+        csv = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "{model}",
+                           "contrastive_results_{model}.csv"),
+        pt  = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "{model}",
+                           "contrastive_results_{model}.pt"),
     params:
-        script = cfg['scripts']["contrastive_explanation"],
-        root_gsnn = os.path.join(cfg['dirs']['runs'], RUN_ID),
-        root_traj = cfg['dirs']["preds"].replace('/predict_grid', ''),
-        out_dir = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "{sample}"),
-        target_gene = cfg['contrastive_explanation_trametinib_mapk']["target_gene"],
-        cell_line_1 = cfg['contrastive_explanation_trametinib_mapk']["cell_line_1"],
-        cell_line_2 = cfg['contrastive_explanation_trametinib_mapk']["cell_line_2"],
-        pert_id = cfg['contrastive_explanation_trametinib_mapk']["pert_id"],
-        dose = cfg['contrastive_explanation_trametinib_mapk']["dose"],
-        horizon = cfg['contrastive_explanation_trametinib_mapk']["horizon"],
-        n_time_pts = cfg['contrastive_explanation_trametinib_mapk']["n_time_pts"],
-        method = cfg['contrastive_explanation_trametinib_mapk']["method"],
-        tol = cfg['contrastive_explanation_trametinib_mapk']["tol"],
-        hard = cfg['contrastive_explanation_trametinib_mapk']["hard"],
-        beta = cfg['contrastive_explanation_trametinib_mapk']["beta"],
-        lr = cfg['contrastive_explanation_trametinib_mapk']["lr"],
-        prior = cfg['contrastive_explanation_trametinib_mapk']["prior"],
-        iters = cfg['contrastive_explanation_trametinib_mapk']["iters"],
-        entropy = cfg['contrastive_explanation_trametinib_mapk']["entropy"],
-        grad_norm_clip = cfg['contrastive_explanation_trametinib_mapk']["grad_norm_clip"],
-        free_edges = cfg['contrastive_explanation_trametinib_mapk']["free_edges"],
-        explanation_target = cfg['contrastive_explanation_trametinib_mapk']["explanation_target"],
+        script             = SCRIPTS["contrastive_explanation"],
+        root_gsnn          = os.path.join(cfg['dirs']['runs'], RUN_ID),
+        root_traj          = cfg['dirs']["preds"].replace('/predict_grid', ''),
+        out_dir            = lambda w: os.path.join(CONTRASTIVE_ROOT, w.output_dir, w.model),
+        target_gene        = lambda w: _ex(w)["target_gene"],
+        cell_line_1        = lambda w: _ex(w)["cell_line_1"],
+        cell_line_2        = lambda w: _ex(w)["cell_line_2"],
+        pert_id            = lambda w: _ex(w)["pert_id"],
+        dose               = lambda w: _ex(w)["dose"],
+        horizon            = lambda w: _ex(w)["horizon"],
+        n_time_pts         = lambda w: _ex(w)["n_time_pts"],
+        method             = lambda w: _ex(w)["method"],
+        tol                = lambda w: _ex(w)["tol"],
+        hard               = lambda w: _ex(w)["hard"],
+        beta               = lambda w: _ex(w)["beta"],
+        lr                 = lambda w: _ex(w)["lr"],
+        prior              = lambda w: _ex(w)["prior"],
+        iters              = lambda w: _ex(w)["iters"],
+        entropy            = lambda w: _ex(w)["entropy"],
+        grad_norm_clip     = lambda w: _ex(w)["grad_norm_clip"],
+        free_edges         = lambda w: _ex(w)["free_edges"],
+        explanation_target = lambda w: _ex(w)["explanation_target"],
+        hnet_flag          = _hnet_explain_arg(),
+        node_activity_args = _na_explain_args(),
     shell:
         """
         mkdir -p {params.out_dir}
         python {params.script} \
             --root_gsnn {params.root_gsnn} \
             --root_traj {params.root_traj} \
-            --sample_id {wildcards.sample} \
+            --model_id {wildcards.model} \
+            --model_path {input.model} \
             --target_gene {params.target_gene} \
             --cell_line_1 {params.cell_line_1} \
             --cell_line_2 {params.cell_line_2} \
@@ -194,26 +737,30 @@ rule contrastive_explanation_trametinib_mapk:
             --grad_norm_clip {params.grad_norm_clip} \
             --free_edges {params.free_edges} \
             --explanation_target {params.explanation_target} \
-            --out {params.out_dir}
+            --out {params.out_dir} \
+            {params.hnet_flag} \
+            {params.node_activity_args}
         """
 
-rule aggregate_contrastive_trametinib_mapk:
-    '''
-    Aggregate contrastive explanation results from all samples for Trametinib/MAPK.
-    Merges cres DataFrames (outer merge with sample suffix).
-    Aggregates out_dicts into a single dictionary.
-    '''
+rule aggregate_contrastive:
+    '''Aggregate per-sample contrastive results for one example.'''
+    wildcard_constraints:
+        output_dir = r"contrastive_explanation_[^/]+",
     input:
-        csvs = expand(os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
-        pts = expand(os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "{sample}", "contrastive_results_{sample}.pt"), sample=SAMPLES),
+        csvs = lambda w: expand(
+            os.path.join(CONTRASTIVE_ROOT, w.output_dir, "{model}",
+                         "contrastive_results_{model}.csv"), model=MODELS),
+        pts  = lambda w: expand(
+            os.path.join(CONTRASTIVE_ROOT, w.output_dir, "{model}",
+                         "contrastive_results_{model}.pt"),  model=MODELS),
     output:
-        cres_csv = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "aggregated_cres.csv"),
-        out_dict = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_DIR, "aggregated_out_dict.pt"),
+        cres_csv = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "aggregated_cres.csv"),
+        out_dict = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "aggregated_out_dict.pt"),
     params:
-        script = cfg['scripts']["aggregate_contrastive"],
-        input_dir = CONTRASTIVE_TRAMETINIB_MAPK_DIR,
-        out_dir = CONTRASTIVE_TRAMETINIB_MAPK_DIR,
-        name = "aggregated",
+        script    = SCRIPTS["aggregate_contrastive"],
+        input_dir = lambda w: os.path.join(CONTRASTIVE_ROOT, w.output_dir),
+        out_dir   = lambda w: os.path.join(CONTRASTIVE_ROOT, w.output_dir),
+        name      = "aggregated",
     shell:
         """
         python {params.script} \
@@ -222,53 +769,73 @@ rule aggregate_contrastive_trametinib_mapk:
             --name {params.name}
         """
 
-rule contrastive_explanation_trametinib_mapk_node_target:
+# ------------------------------------------------------------------------------------
+# Non-contrastive explanation rules
+# ------------------------------------------------------------------------------------
+
+def _nc(w):
+    return NC_EXAMPLES_BY_OUTPUT_DIR[w.output_dir]
+
+rule non_contrastive_explanation:
+    '''Non-contrastive explanation for one (output_dir, sample) pair.
+
+    output_dir encodes both the parent contrastive example and a single
+    cell line (e.g. ``non_contrastive_explanation_trametinib_mapk__MDAMB231``).
+    All hyperparameters are inherited from the parent contrastive entry.
     '''
-    Contrastive explanation for Trametinib (MEK inhibitor) - MAPK-addicted vs MAPK-independent response.
-    Compares MDAMB231 (RAS-mutant, MAPK-addicted) vs MCF7 (PIK3CA-mutant, MAPK-independent) cell lines.
-    Target gene: DUSP6 (ERK-feedback regulator gene).
-    Uses node-level explanation target instead of edge-level.
-    '''
+    wildcard_constraints:
+        output_dir = r"non_contrastive_explanation_[^/]+",
     input:
         bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
-        model = os.path.join(PRETRAIN_DIR, "pretrained_model_{sample}.pt"),
-        scale = os.path.join(PRETRAIN_DIR, "dxdt_scale_{sample}.pt"),
+        # Switches between pretrained_model and trained_model based on
+        # train.enabled; see _model_artifact() for the gating logic.
+        model  = lambda w: _model_artifact(w.model),
+        scale  = os.path.join(PRETRAIN_DIR, "dxdt_scale_{model}.pt"),
+        **({"hnet": os.path.join(PRETRAIN_DIR, "pretrained_hnet_{model}.pt")} if (USE_HNET and HNET_USE_EXP) else {}),
+        # Same gating as `contrastive_explanation`: only required when
+        # node_activity is enabled.  In legacy mode (USE_NA=False) this
+        # entry is omitted and the rule's input set is byte-identical to
+        # the pre-node-activity workflow.
+        **({"node_activity": NA_PATH} if USE_NA else {}),
     output:
-        csv = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "{sample}", "contrastive_results_{sample}.csv"),
-        pt = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "{sample}", "contrastive_results_{sample}.pt"),
+        csv = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "{model}",
+                           "non_contrastive_results_{model}.csv"),
+        pt  = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "{model}",
+                           "non_contrastive_results_{model}.pt"),
     params:
-        script = cfg['scripts']["contrastive_explanation"],
-        root_gsnn = os.path.join(cfg['dirs']['runs'], RUN_ID),
-        root_traj = cfg['dirs']["preds"].replace('/predict_grid', ''),
-        out_dir = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "{sample}"),
-        target_gene = cfg['contrastive_explanation_trametinib_mapk_node_target']["target_gene"],
-        cell_line_1 = cfg['contrastive_explanation_trametinib_mapk_node_target']["cell_line_1"],
-        cell_line_2 = cfg['contrastive_explanation_trametinib_mapk_node_target']["cell_line_2"],
-        pert_id = cfg['contrastive_explanation_trametinib_mapk_node_target']["pert_id"],
-        dose = cfg['contrastive_explanation_trametinib_mapk_node_target']["dose"],
-        horizon = cfg['contrastive_explanation_trametinib_mapk_node_target']["horizon"],
-        n_time_pts = cfg['contrastive_explanation_trametinib_mapk_node_target']["n_time_pts"],
-        method = cfg['contrastive_explanation_trametinib_mapk_node_target']["method"],
-        tol = cfg['contrastive_explanation_trametinib_mapk_node_target']["tol"],
-        hard = cfg['contrastive_explanation_trametinib_mapk_node_target']["hard"],
-        beta = cfg['contrastive_explanation_trametinib_mapk_node_target']["beta"],
-        lr = cfg['contrastive_explanation_trametinib_mapk_node_target']["lr"],
-        prior = cfg['contrastive_explanation_trametinib_mapk_node_target']["prior"],
-        iters = cfg['contrastive_explanation_trametinib_mapk_node_target']["iters"],
-        entropy = cfg['contrastive_explanation_trametinib_mapk_node_target']["entropy"],
-        grad_norm_clip = cfg['contrastive_explanation_trametinib_mapk_node_target']["grad_norm_clip"],
-        free_edges = cfg['contrastive_explanation_trametinib_mapk_node_target']["free_edges"],
-        explanation_target = cfg['contrastive_explanation_trametinib_mapk_node_target']["explanation_target"],
+        script             = SCRIPTS["non_contrastive_explanation"],
+        root_gsnn          = os.path.join(cfg['dirs']['runs'], RUN_ID),
+        root_traj          = cfg['dirs']["preds"].replace('/predict_grid', ''),
+        out_dir            = lambda w: os.path.join(CONTRASTIVE_ROOT, w.output_dir, w.model),
+        target_gene        = lambda w: _nc(w)["target_gene"],
+        cell_line          = lambda w: _nc(w)["cell_line"],
+        pert_id            = lambda w: _nc(w)["pert_id"],
+        dose               = lambda w: _nc(w)["dose"],
+        horizon            = lambda w: _nc(w)["horizon"],
+        n_time_pts         = lambda w: _nc(w)["n_time_pts"],
+        method             = lambda w: _nc(w)["method"],
+        tol                = lambda w: _nc(w)["tol"],
+        hard               = lambda w: _nc(w)["hard"],
+        beta               = lambda w: _nc(w)["beta"],
+        lr                 = lambda w: _nc(w)["lr"],
+        prior              = lambda w: _nc(w)["prior"],
+        iters              = lambda w: _nc(w)["iters"],
+        entropy            = lambda w: _nc(w)["entropy"],
+        grad_norm_clip     = lambda w: _nc(w)["grad_norm_clip"],
+        free_edges         = lambda w: _nc(w)["free_edges"],
+        explanation_target = lambda w: _nc(w)["explanation_target"],
+        hnet_flag          = _hnet_explain_arg(),
+        node_activity_args = _na_explain_args(),
     shell:
         """
         mkdir -p {params.out_dir}
         python {params.script} \
             --root_gsnn {params.root_gsnn} \
             --root_traj {params.root_traj} \
-            --sample_id {wildcards.sample} \
+            --model_id {wildcards.model} \
+            --model_path {input.model} \
             --target_gene {params.target_gene} \
-            --cell_line_1 {params.cell_line_1} \
-            --cell_line_2 {params.cell_line_2} \
+            --cell_line {params.cell_line} \
             --pert_id {params.pert_id} \
             --dose {params.dose} \
             --horizon {params.horizon} \
@@ -284,30 +851,124 @@ rule contrastive_explanation_trametinib_mapk_node_target:
             --grad_norm_clip {params.grad_norm_clip} \
             --free_edges {params.free_edges} \
             --explanation_target {params.explanation_target} \
-            --out {params.out_dir}
+            --out {params.out_dir} \
+            {params.hnet_flag} \
+            {params.node_activity_args}
         """
 
-rule aggregate_contrastive_trametinib_mapk_node_target:
-    '''
-    Aggregate contrastive explanation results from all samples for Trametinib/MAPK (node target).
-    Merges cres DataFrames (outer merge with sample suffix).
-    Aggregates out_dicts into a single dictionary.
-    '''
+rule aggregate_non_contrastive:
+    '''Aggregate per-sample non-contrastive results for one (example, cell_line) pair.'''
+    wildcard_constraints:
+        output_dir = r"non_contrastive_explanation_[^/]+",
     input:
-        csvs = expand(os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "{sample}", "contrastive_results_{sample}.csv"), sample=SAMPLES),
-        pts = expand(os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "{sample}", "contrastive_results_{sample}.pt"), sample=SAMPLES),
+        csvs = lambda w: expand(
+            os.path.join(CONTRASTIVE_ROOT, w.output_dir, "{model}",
+                         "non_contrastive_results_{model}.csv"), model=MODELS),
+        pts  = lambda w: expand(
+            os.path.join(CONTRASTIVE_ROOT, w.output_dir, "{model}",
+                         "non_contrastive_results_{model}.pt"),  model=MODELS),
     output:
-        cres_csv = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "aggregated_cres.csv"),
-        out_dict = os.path.join(CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR, "aggregated_out_dict.pt"),
+        cres_csv = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "aggregated_cres.csv"),
+        out_dict = os.path.join(CONTRASTIVE_ROOT, "{output_dir}", "aggregated_out_dict.pt"),
     params:
-        script = cfg['scripts']["aggregate_contrastive"],
-        input_dir = CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR,
-        out_dir = CONTRASTIVE_TRAMETINIB_MAPK_NODE_TARGET_DIR,
-        name = "aggregated",
+        script    = SCRIPTS["aggregate_contrastive"],
+        input_dir = lambda w: os.path.join(CONTRASTIVE_ROOT, w.output_dir),
+        out_dir   = lambda w: os.path.join(CONTRASTIVE_ROOT, w.output_dir),
+        name      = "aggregated",
     shell:
         """
         python {params.script} \
             --input_dir {params.input_dir} \
             --out {params.out_dir} \
-            --name {params.name}
+            --name {params.name} \
+            --results_prefix non_contrastive_results
+        """
+
+# ------------------------------------------------------------------------------------
+# Explanation evaluation
+# ------------------------------------------------------------------------------------
+
+rule eval_explanation:
+    '''Evaluate explanation quality and training metrics for one example.'''
+    input:
+        bionet = os.path.join(BIO_NET_DIR, "bionetwork.pt"),
+        contrastive_csv = lambda w: os.path.join(
+            CONTRASTIVE_ROOT, EXAMPLES[w.example]["output_dir"], "aggregated_cres.csv"),
+        contrastive_pt = lambda w: os.path.join(
+            CONTRASTIVE_ROOT, EXAMPLES[w.example]["output_dir"], "aggregated_out_dict.pt"),
+        nc1_csv = lambda w: os.path.join(
+            CONTRASTIVE_ROOT,
+            _nc_dir_for_example(EXAMPLES[w.example]["output_dir"], EXAMPLES[w.example]["cell_line_1"]),
+            "aggregated_cres.csv"),
+        nc2_csv = lambda w: os.path.join(
+            CONTRASTIVE_ROOT,
+            _nc_dir_for_example(EXAMPLES[w.example]["output_dir"], EXAMPLES[w.example]["cell_line_2"]),
+            "aggregated_cres.csv"),
+        pretrain_metrics = expand(
+            os.path.join(PRETRAIN_DIR, "val_metrics_pretrain_{model}.json"), model=MODELS),
+        train_metrics = (
+            expand(os.path.join(TRAIN_DIR, "val_metrics_train_{model}.json"), model=MODELS)
+            if USE_TRAIN else []),
+    output:
+        pt = os.path.join(EVAL_DIR, "{example}.pt"),
+        json = os.path.join(EVAL_DIR, "{example}.json"),
+    params:
+        script = SCRIPTS["eval"],
+        root_gsnn = CONTRASTIVE_ROOT,
+        root_traj = ROOT_TRAJ,
+        out_dir = EVAL_DIR,
+        config_path = CONFIG_PATH,
+        output_dir = lambda w: EXAMPLES[w.example]["output_dir"],
+        explanation_target = lambda w: EXAMPLES[w.example]["explanation_target"],
+        target_gene = lambda w: EXAMPLES[w.example]["target_gene"],
+        pert_id = lambda w: EXAMPLES[w.example]["pert_id"],
+        cell_line_1 = lambda w: EXAMPLES[w.example]["cell_line_1"],
+        cell_line_2 = lambda w: EXAMPLES[w.example]["cell_line_2"],
+        pretrain_dir = PRETRAIN_DIR,
+        train_dir = TRAIN_DIR,
+        use_train_flag = "--use_train" if USE_TRAIN else "",
+        eval_spec_json = lambda w: json.dumps(EXAMPLES[w.example]["eval"]),
+        model_id = MODELS[0] if MODELS else "model_0",
+    shell:
+        """
+        python {params.script} \
+            --root_gsnn {params.root_gsnn} \
+            --root_traj {params.root_traj} \
+            --example {wildcards.example} \
+            --output_dir {params.output_dir} \
+            --explanation_target {params.explanation_target} \
+            --target_gene {params.target_gene} \
+            --pert_id {params.pert_id} \
+            --cell_line_1 {params.cell_line_1} \
+            --cell_line_2 {params.cell_line_2} \
+            --out_dir {params.out_dir} \
+            --config_path {params.config_path} \
+            --eval_spec_json '{params.eval_spec_json}' \
+            --pretrain_dir {params.pretrain_dir} \
+            --train_dir {params.train_dir} \
+            {params.use_train_flag} \
+            --model_id {params.model_id}
+        """
+
+rule aggregate_eval:
+    '''Merge per-example eval artifacts into one run-level dict and wide CSV.'''
+    input:
+        expand(os.path.join(EVAL_DIR, "{example}.pt"), example=EVAL_EXAMPLES),
+    output:
+        pt = os.path.join(EVAL_DIR, "eval_results.pt"),
+        json = os.path.join(EVAL_DIR, "eval_results.json"),
+        csv = os.path.join(EVAL_DIR, "eval_results.csv"),
+        config = os.path.join(EVAL_DIR, "config.yaml"),
+    params:
+        script = SCRIPTS["aggregate_eval"],
+        eval_dir = EVAL_DIR,
+        config_path = CONFIG_PATH,
+        examples = ",".join(EVAL_EXAMPLES),
+    shell:
+        """
+        python {params.script} \
+            --eval_dir {params.eval_dir} \
+            --config_path {params.config_path} \
+            --examples {params.examples} \
+            --out_name eval_results
         """

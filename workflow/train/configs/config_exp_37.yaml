@@ -1,0 +1,304 @@
+run_id: exp_37
+
+# Optional Snakemake metadata directory (.snakemake/, locks, logs). When empty
+# (default), the workflow uses <dirs.runs>/<run_id>/.snakemake/ so parallel
+# runs with different run_id values do not contend on workflow/train/.snakemake/.
+snakemake_workdir: ''
+
+# Replicate GSNN models trained on the same predict_grid with per-model seeds.
+n_models: 1
+base_seed: 0
+
+dirs:
+  data: /home/exacloud/gscratch/mcweeney_lab/evans/data
+  extdata: ../extdata/
+  runs: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-gsnn
+  preds: /home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/tune/tune_37/output/predict_grid
+  bio_network: bionetwork
+  pretrain: pretrain
+  train: train
+
+scripts:
+  make_bio_network:             ../scripts/make_bio_network.py
+  pretrain:                     ../scripts/pretrain_gsnn_with_dxdt.py
+  train:                        ../scripts/train_gsnn_with_odeint.py
+  contrastive_explanation:      ../scripts/contrastive_explanation.py
+  aggregate_contrastive:        ../scripts/aggregate_contrastive_results.py
+  non_contrastive_explanation:  ../scripts/non_contrastive_explanation.py
+  eval:                         ../scripts/eval_explanation.py
+  aggregate_eval:               ../scripts/aggregate_eval_results.py
+
+##################################################################################
+#################################### MAKE BIO NETWORK ####################################### 
+##################################################################################
+
+make_bio_network:
+  include_tf_mirna:       true
+  include_pathway_extra:  false
+  include_kinase_extra:   false
+  include_ligrec_extra:   false
+  include_collecTRI:      false
+  include_dorothea:       true
+  include_omnipath:       true
+  dorothea_levels:        'ABC'
+  complex_handling:       'link'
+  min_n_references:       0
+  min_curation_effort:    3
+  max_dti_kd:             100.0
+  filter_depth:           8
+  remove_output_edges:    false
+  n_edges_to_remove:      0
+  seed:                   0
+  val_cells_per_drug:     1
+  no_cell_line_edges:     true
+  include_gene_inputs:    true
+  no_uniprot_synonyms:    false
+  gene_stats:             '/home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/proc/lincs-proc-v06/gene_stats.dict'
+  cond_info:              '/home/exacloud/gscratch/mcweeney_lab/evans/lincs-modeling/outputs/lincs-traj/runs/proc/lincs-proc-v06/cond_info.csv'
+
+##################################################################################
+#################################### PRETRAIN ####################################### 
+##################################################################################
+
+pretrain:
+  objective:                'mse'   # 'nll' | 'mse'
+  sigma_floor:              0.1  # NLL variance floor for this stage (falls back to top-level sigma_floor when unset)
+  clip_grad_norm:           1.0     # max grad L2-norm per step; <=0 disables
+  batch_size:               512
+  num_workers:              4
+  epochs:                   0
+  lr:                       1e-2
+  wd:                       1e-4
+  patience:                 3
+
+  init:                     'degree_normalized'
+  channels:                 4
+  layers:                   8
+  share_layers:             false
+  dropout:                  0.
+  norm:                     'none'
+  checkpoint:               false
+  add_function_self_edges:  true
+  bias:                     false
+  residual:                 true
+  node_mlp:                 false
+  node_mlp_dim:             16
+  node_attn:                false
+  attn_mlp_hidden:          16
+  
+  model:                    'BIOGSNN'
+  dxdt_nonlin:              leaky_relu
+  init_rna_half_life:       9.0
+  dxdt_clip:                10.0    # BIOGSNN-only: intrinsic soft tanh bound on net dx/dt (native scaled-dxdt units), fixed at construction and carried into the odeint fine-tune. <=0 disables
+  gamma_prior_weight:       1e-1
+  
+  optimizer:                'muon'
+  amp:                      true
+  torch32:                  true
+  resume_incomplete:        false
+
+##################################################################################
+#################################### TRAIN ####################################### 
+##################################################################################
+
+train:
+  enabled:            true
+  objective:          'mse' # 'nll' | 'mse'
+  sigma_floor:        0.1 # NLL variance floor for this stage (falls back to top-level sigma_floor when unset)
+  clip_grad_norm:     1.0   # max grad L2-norm per step; <=0 disables
+  batch_size:         32
+  num_workers:        4
+  epochs:             3
+  lr:                 1e-3
+  wd:                 1e-2
+  patience:           3
+  horizon:            25     # can't be bigger than the number of time points in the predict_grid
+  multiple_shooting:  false
+  method:             'euler'
+  tol:                1e-1
+  adjoint:            false   # use odeint_adjoint (O(1) memory in solver steps); avoids OOM with adaptive solvers on stiff systems. false -> plain odeint
+  gamma_prior_weight: 1e-1
+  optimizer:          'muon'
+  amp:                true
+  grad_scaler:        false
+  torch32:            true
+  resume_incomplete:  false
+
+node_activity:
+  enabled:        true
+  path:           ''
+  mode:           per-channel
+  hidden_dim:     16
+  temperature:    1.0
+  transform:      sigmoid
+  mass:           1.
+  dropout:        0.0
+  eps:            1e-6
+  alpha_decay:    0
+  features:       ['cell_line']
+
+hypernetwork:
+  enabled:             false
+  stochastic_channels: 0
+  width:               16
+  pz:                  'bernoulli'
+  learn_pz:            false
+  affine:              false
+  norm:                'none'
+  dropout:             0.0
+  bias:                true
+  embed_dim:           0
+  n_train_samples:     1
+  n_eval_samples:      1
+  loss:                'mse'
+  pretrain_init:       false
+  use_in_explanation:  true
+
+##################################################################################
+#################################### CONTRASTIVE EXPLANATIONS ####################################### 
+##################################################################################
+
+contrastive_explanations:
+
+  # Trametinib (MEK inhibitor) - MAPK response
+  # Compares MDAMB231 (RAS-mutant, MAPK-addicted) vs MCF7 (PIK3CA-mutant, MAPK-independent)
+  trametinib_mapk:
+    output_dir: contrastive_explanation_trametinib_mapk
+    target_gene: 'DUSP6'
+    cell_line_1: 'MDAMB231'
+    cell_line_2: 'MCF7'
+    pert_id: 'TRAMETINIB'
+    dose: 10.0
+    horizon: 24 # hours 
+    n_time_pts: 50
+    method: 'euler'
+    tol: 1e-4
+    hard: ''  # empty for False, '--hard' for True
+    beta: 1e-2
+    lr: 1e-2
+    prior: 3
+    iters: 1000
+    entropy: 1.0
+    grad_norm_clip: 1.0
+    free_edges: 100
+    explanation_target: 'edge'
+    eval:
+      expected_direction: 'negative'
+      max_path_length: 6
+      primary_regulators:
+        - {target_node: 'RNA__DUSP6', regulator: 'PROTEIN__ETS1'}
+        - {target_node: 'PROTEIN__ETS1', regulator: 'PROTEIN__MAPK3'}
+        - {target_node: 'PROTEIN__MAPK3', regulator: 'PROTEIN__MAP2K1'}
+        - {target_node: 'PROTEIN__MAPK3', regulator: 'PROTEIN__MAP2K2'}
+      expected_edges:
+        - {source: 'DRUG__TRAMETINIB', target: 'PROTEIN__MAP2K1'}
+        - {source: 'DRUG__TRAMETINIB', target: 'PROTEIN__MAP2K2'}
+        - {source: 'PROTEIN__MAP2K1', target: 'PROTEIN__MAPK3'}
+        - {source: 'PROTEIN__MAP2K2', target: 'PROTEIN__MAPK3'}
+        - {source: 'PROTEIN__MAPK3', target: 'PROTEIN__ETS1'}
+        - {source: 'PROTEIN__ETS1', target: 'RNA__DUSP6'}
+      expected_paths:
+        - 'MAP2K1 -> MAPK3 -> ETS1 -> DUSP6'
+        - 'MAP2K2 -> MAPK3 -> ETS1 -> DUSP6'
+
+  trametinib_mapk_node_target:
+    output_dir: contrastive_explanation_trametinib_mapk_node_target
+    target_gene: 'DUSP6'
+    cell_line_1: 'MDAMB231'
+    cell_line_2: 'MCF7'
+    pert_id: 'TRAMETINIB'
+    dose: 10.0
+    horizon: 24
+    n_time_pts: 50
+    method: 'euler'
+    tol: 1e-4
+    hard: ''  # empty for False, '--hard' for True
+    beta: 1e-2
+    lr: 1e-2
+    prior: 3
+    iters: 1000
+    entropy: 1.0
+    grad_norm_clip: 1.0
+    free_edges: 100
+    explanation_target: 'node'
+    eval:
+      expected_direction: 'negative'
+      expected_nodes:
+        - 'DRUG__TRAMETINIB'
+        - 'PROTEIN__MAP2K1'
+        - 'PROTEIN__MAP2K2'
+        - 'PROTEIN__MAPK3'
+        - 'PROTEIN__ETS1'
+        - 'RNA__DUSP6'
+        - 'GENE__DUSP6'
+
+  # Palbociclib (CDK4/6 inhibitor) - RB/E2F cell-cycle response
+  palbociclib_ccna2:
+    output_dir: contrastive_explanation_palbociclib_ccna2
+    target_gene: 'CCNA2'
+    cell_line_1: 'T47D'
+    cell_line_2: 'MDAMB468'
+    pert_id: 'PALBOCICLIB'
+    dose: 10.0
+    horizon: 24
+    n_time_pts: 50
+    method: 'euler'
+    tol: 1e-4
+    hard: ''  # empty for False, '--hard' for True
+    beta: 1e-2
+    lr: 1e-2
+    prior: 3
+    iters: 1000
+    entropy: 1.0
+    grad_norm_clip: 1.0
+    free_edges: 100
+    explanation_target: 'edge'
+    eval:
+      expected_direction: 'negative'
+      max_path_length: 6
+      primary_regulators:
+        - {target_node: 'RNA__CCNA2', regulator: 'PROTEIN__E2F1'}
+        - {target_node: 'PROTEIN__E2F1', regulator: 'PROTEIN__RB1'}
+        - {target_node: 'PROTEIN__RB1', regulator: 'PROTEIN__CDK4'}
+        - {target_node: 'PROTEIN__RB1', regulator: 'PROTEIN__CDK6'}
+      expected_edges:
+        - {source: 'DRUG__PALBOCICLIB', target: 'PROTEIN__CDK4'}
+        - {source: 'DRUG__PALBOCICLIB', target: 'PROTEIN__CDK6'}
+        - {source: 'PROTEIN__CDK4', target: 'PROTEIN__RB1'}
+        - {source: 'PROTEIN__CDK6', target: 'PROTEIN__RB1'}
+        - {source: 'PROTEIN__RB1', target: 'PROTEIN__E2F1'}
+        - {source: 'PROTEIN__E2F1', target: 'RNA__CCNA2'}
+      expected_paths:
+        - 'CDK4 -> RB1 -> E2F1 -> CCNA2'
+        - 'CDK6 -> RB1 -> E2F1 -> CCNA2'
+
+  palbociclib_ccna2_node_target:
+    output_dir: contrastive_explanation_palbociclib_ccna2_node_target
+    target_gene: 'CCNA2'
+    cell_line_1: 'T47D'
+    cell_line_2: 'MDAMB468'
+    pert_id: 'PALBOCICLIB'
+    dose: 10.0
+    horizon: 24
+    n_time_pts: 50
+    method: 'euler'
+    tol: 1e-4
+    hard: ''  # empty for False, '--hard' for True
+    beta: 1e-2
+    lr: 1e-2
+    prior: 3
+    iters: 1000
+    entropy: 1.0
+    grad_norm_clip: 1.0
+    free_edges: 100
+    explanation_target: 'node'
+    eval:
+      expected_direction: 'negative'
+      expected_nodes:
+        - 'DRUG__PALBOCICLIB'
+        - 'PROTEIN__CDK4'
+        - 'PROTEIN__CDK6'
+        - 'PROTEIN__RB1'
+        - 'PROTEIN__E2F1'
+        - 'RNA__CCNA2'
+        - 'GENE__CCNA2'

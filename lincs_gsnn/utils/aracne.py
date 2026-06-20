@@ -7,6 +7,12 @@ import numpy as np
 import pandas as pd
 import torch
 
+from lincs_gsnn.proc.graph import (
+    gene_symbol_from_node,
+    map_function_node,
+    protein_to_rna_edge_mask,
+)
+
 
 def build_candidate_edges(data, gene_names, net_dir):
     """Build the PROTEIN->RNA candidate edge DataFrame with train/test/negative labels.
@@ -17,16 +23,25 @@ def build_candidate_edges(data, gene_names, net_dir):
     """
     net_dir = Path(net_dir)
     node_names = np.array(data.node_names_dict['function'])
+    function_node_map = getattr(data, 'function_node_map', None)
+    fn_set = set(data.node_names_dict['function'])
 
     res = pd.DataFrame({
         'source': node_names[data.edge_index_dict['function', 'to', 'function'][0]],
         'target': node_names[data.edge_index_dict['function', 'to', 'function'][1]],
     }).assign(train_edge=True)
 
-    candidates = pd.DataFrame({
-        'source': ['PROTEIN__' + g1 for g1 in gene_names for g2 in gene_names],
-        'target': ['RNA__' + g2 for g1 in gene_names for g2 in gene_names],
-    }).assign(candidate=True)
+    cand_src, cand_tgt = [], []
+    for g1 in gene_names:
+        for g2 in gene_names:
+            if g1 == g2:
+                continue
+            s = map_function_node(f'PROTEIN__{g1}', function_node_map)
+            t = map_function_node(f'RNA__{g2}', function_node_map)
+            if s in fn_set and t in fn_set:
+                cand_src.append(s)
+                cand_tgt.append(t)
+    candidates = pd.DataFrame({'source': cand_src, 'target': cand_tgt}).assign(candidate=True)
 
     test_edges = pd.read_csv(net_dir / 'removed_edges.csv')
     test_edges = (
@@ -42,8 +57,8 @@ def build_candidate_edges(data, gene_names, net_dir):
         res[col] = res[col].fillna(False).astype(bool)
 
     res = res.assign(negative=lambda x: ~x.test_edge & ~x.train_edge)
-    res = res.assign(source_gene=lambda x: x.source.str.split('__', expand=True)[1])
-    res = res.assign(target_gene=lambda x: x.target.str.split('__', expand=True)[1])
+    res = res.assign(source_gene=lambda x: x.source.map(gene_symbol_from_node))
+    res = res.assign(target_gene=lambda x: x.target.map(gene_symbol_from_node))
 
     gene2idx = pd.DataFrame({'gene': gene_names, 'gene_idx': range(len(gene_names))})
     res = res.merge(
@@ -56,7 +71,7 @@ def build_candidate_edges(data, gene_names, net_dir):
     )
 
     res = res[res.source.isin(data.node_names_dict['function']) & res.target.isin(data.node_names_dict['function'])]
-    res = res[lambda x: x.source.str.contains('PROTEIN__') & x.target.str.contains('RNA__')]
+    res = res[protein_to_rna_edge_mask(res, function_node_map=function_node_map)]
     res = res[lambda x: x.candidate]
     res = res[lambda x: x.source_gene != x.target_gene]
 

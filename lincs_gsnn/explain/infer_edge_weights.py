@@ -12,7 +12,8 @@ def freeze_(model):
     for param in model.parameters():
         param.requires_grad = False 
 
-def infer_edge_weights(model, data, cond, target_genes, obs_dir, dxdt_scale, 
+def infer_edge_weights(model, data, cond, target_genes, pred_dir, dxdt_scale, 
+                       output_names=None, src_names=None, sigma_floor=1e-4,
                        n_ctrl_pts=5, degree=3, prior=0, lr=5e-2, beta=5e-4, 
                        epochs=250, batch_size=600, num_workers=2, dropout=0): 
     
@@ -23,9 +24,12 @@ def infer_edge_weights(model, data, cond, target_genes, obs_dir, dxdt_scale,
 
     dataset = DXDTDataset(
                 meta = cond, 
-                obs_dir=obs_dir,
+                pred_dir=pred_dir,
                 scale=dxdt_scale,
                 input_names=data.node_names_dict['input'],
+                output_names=output_names or data.node_names_dict['output'],
+                src_names=src_names or data.node_names_dict['output'],
+                sigma_floor=sigma_floor,
                 return_time=True
             )
 
@@ -55,11 +59,11 @@ def infer_edge_weights(model, data, cond, target_genes, obs_dir, dxdt_scale,
     metrics = {'norm': [], 'mse': [], 'r2': []}
     for  epochs in range(epochs):
         epoch_metrics = {'norm': 0, 'mse': 0, 'r2': 0}
-        for X, dxdt, t in loader:
+        for X, dxdt_mu, dxdt_sigma, t in loader:
             optim.zero_grad()
 
             X = X.to(device)
-            dxdt = dxdt.to(device)
+            dxdt_mu = dxdt_mu.to(device)
             t = t.to(device)
 
             w = SWE(t).sigmoid()  
@@ -67,16 +71,16 @@ def infer_edge_weights(model, data, cond, target_genes, obs_dir, dxdt_scale,
             out = model(X, edge_mask=w) 
 
             out = out[:, target_ixs] 
-            dxdt = dxdt[:, target_ixs]
+            dxdt_mu = dxdt_mu[:, target_ixs]
 
-            mse = crit(out, dxdt) 
+            mse = crit(out, dxdt_mu) 
             norm = w.norm()
             loss = mse + beta * norm
 
             loss.backward()
             optim.step()
 
-            r2 = r2_score(dxdt.cpu().detach().numpy(), out.cpu().detach().numpy())
+            r2 = r2_score(dxdt_mu.cpu().detach().numpy(), out.cpu().detach().numpy())
 
             epoch_metrics['norm'] += norm.item()
             epoch_metrics['mse'] += mse.item()

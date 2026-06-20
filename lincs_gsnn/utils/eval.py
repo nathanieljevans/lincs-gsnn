@@ -16,9 +16,16 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 from sklearn.metrics import roc_auc_score, average_precision_score
-import omnipath as op 
+import omnipath as op
 
-def eval_edge_inference(res, data, metric):
+from lincs_gsnn.proc.graph import (
+    gene_symbol_from_node,
+    map_function_node,
+    protein_to_rna_edge_mask,
+)
+
+
+def eval_edge_inference(res, data, metric, function_node_map=None):
     '''Evaluate edge inference across train, test, test_tft, and test_tft_isolate subsets.
 
     Filters ``res`` to non-self PROTEIN -> RNA edges, identifies isolate targets
@@ -40,6 +47,9 @@ def eval_edge_inference(res, data, metric):
         Graph data object with ``node_names_dict``, ``edge_index_dict``.
     metric : str
         Name of the numeric score column in ``res`` (higher = more likely edge).
+    function_node_map : dict, optional
+        ``old_name -> new_name`` from graph simplification (``data.function_node_map``).
+        When omitted, uses ``getattr(data, 'function_node_map', None)``.
 
     Returns
     -------
@@ -48,7 +58,10 @@ def eval_edge_inference(res, data, metric):
         neg) each containing auroc, aupr, mrr, top1_acc, top10_acc,
         top100_acc, and n (number of edges in that subset).
     '''
-    
+
+    if function_node_map is None:
+        function_node_map = getattr(data, "function_node_map", None)
+
     ################### Filtering ###################
 
     # The test set nodes were sampled specifically from nodes that had more than 2 edges 
@@ -61,7 +74,9 @@ def eval_edge_inference(res, data, metric):
     train_edges = pd.DataFrame({'source': src_names, 'target': dst_names})
 
     G = nx.from_pandas_edgelist(train_edges[['source', 'target']], source='source', target='target', create_using=nx.DiGraph())
-    for g in data.node_names_dict['output']: G.add_node('RNA__' + g.split('__')[1])
+    for g in data.node_names_dict['output']:
+        rna_node = map_function_node('RNA__' + g.split('__', 1)[1], function_node_map)
+        G.add_node(rna_node)
     isolates = [n for n in G.nodes() if G.in_degree(n) == 0 and G.out_degree(n) == 0]
 
     # NOT REMOVING - BC now we can evaluate with tft edges
@@ -76,17 +91,14 @@ def eval_edge_inference(res, data, metric):
 
     ########################################################### 
 
-    # The test set is also sampled from high-confidence transcription factor targets
-    # This means that only Protein --> RNA edges are present in the test set 
-    # additionally, including RNA --> RNA edges will bias the performance metrics 
-    # to be safe, we should only consider Protein --> RNA edges in the test set 
-    res = res[lambda x: x.source.str.contains('PROTEIN__') & x.target.str.contains('RNA__')]
+    # Protein --> RNA edges only (legacy prefixes or simplified supernode names).
+    res = res[protein_to_rna_edge_mask(res, function_node_map=function_node_map)]
 
     ########################################################### 
 
     # drop self edges 
-    res = res.assign(source_genesymbol = lambda x: x.source.str.split('__', expand=True)[1])
-    res = res.assign(target_genesymbol = lambda x: x.target.str.split('__', expand=True)[1])
+    res = res.assign(source_genesymbol=lambda x: x.source.map(gene_symbol_from_node))
+    res = res.assign(target_genesymbol=lambda x: x.target.map(gene_symbol_from_node))
     res = res[lambda x: x.source_genesymbol != x.target_genesymbol]
 
     ########################## Omnipath Extra TF Targets ########################## 
@@ -96,8 +108,14 @@ def eval_edge_inference(res, data, metric):
 
 
     tft = op.interactions.Transcriptional().get(genesymbol=True)[['source_genesymbol', 'target_genesymbol']]
-    tft = tft.assign(source = lambda x: 'PROTEIN__' + x.source_genesymbol)
-    tft = tft.assign(target = lambda x: 'RNA__' + x.target_genesymbol)
+    tft = tft.assign(
+        source=lambda df: df['source_genesymbol'].map(
+            lambda g: map_function_node(f'PROTEIN__{g}', function_node_map)
+        ),
+        target=lambda df: df['target_genesymbol'].map(
+            lambda g: map_function_node(f'RNA__{g}', function_node_map)
+        ),
+    )
     tft = tft[['source', 'target']]
     tft = tft.drop_duplicates()
     tft = tft.assign(in_tft = True)  
@@ -136,6 +154,7 @@ def eval_edge_inference(res, data, metric):
     mrr_test_tft = np.mean(1 / res[lambda x: x.test_tft]['rank'].values)
     mrr_test_tft_isolate = np.mean(1 / res[lambda x: x.test_tft & x.isolate_target]['rank'].values)
     mrr_neg = np.mean(1 / res[lambda x: x.negative_edge]['rank'].values)
+    mrr_test_has_expr = np.mean(1 / res[lambda x: x.test_edge & x.has_expr]['rank'].values)
 
     ###########################################################  
 
@@ -145,6 +164,7 @@ def eval_edge_inference(res, data, metric):
     top1_acc_test_tft = np.mean(res[lambda x: x.test_tft]['rank'] <= 1)
     top1_acc_test_tft_isolate = np.mean(res[lambda x: x.test_tft & x.isolate_target]['rank'] <= 1)
     top1_acc_neg = np.mean(res[lambda x: x.negative_edge]['rank'] <= 1)
+    top1_acc_test_has_expr = np.mean(res[lambda x: x.test_edge & x.has_expr]['rank'] <= 1)
 
     ###########################################################  
 
@@ -154,6 +174,7 @@ def eval_edge_inference(res, data, metric):
     top10_acc_test_tft = np.mean(res[lambda x: x.test_tft]['rank'] <= 10)
     top10_acc_test_tft_isolate = np.mean(res[lambda x: x.test_tft & x.isolate_target]['rank'] <= 10)
     top10_acc_neg = np.mean(res[lambda x: x.negative_edge]['rank'] <= 10)
+    top10_acc_test_has_expr = np.mean(res[lambda x: x.test_edge & x.has_expr]['rank'] <= 10)
 
     ###########################################################  
     
@@ -163,6 +184,7 @@ def eval_edge_inference(res, data, metric):
     top100_acc_test_tft = np.mean(res[lambda x: x.test_tft]['rank'] <= 100)
     top100_acc_test_tft_isolate = np.mean(res[lambda x: x.test_tft & x.isolate_target]['rank'] <= 100)
     top100_acc_neg = np.mean(res[lambda x: x.negative_edge]['rank'] <= 100)
+    top100_acc_test_has_expr = np.mean(res[lambda x: x.test_edge & x.has_expr]['rank'] <= 100)
 
     ###########################################################  
     
@@ -188,6 +210,12 @@ def eval_edge_inference(res, data, metric):
     else:
         test_tft_isolate_auroc = np.nan
 
+    test_has_expr_res = res[lambda x: (x.test_edge | x.negative_edge) & x.has_expr]
+    if test_has_expr_res.test_edge.sum() > 0:
+        test_has_expr_auroc = roc_auc_score(test_has_expr_res.test_edge.values.astype(int), test_has_expr_res[metric].values.astype(float))
+    else:
+        test_has_expr_auroc = np.nan
+
     ###########################################################   
 
     # calculate AUPR  
@@ -204,6 +232,11 @@ def eval_edge_inference(res, data, metric):
     else:
         test_tft_isolate_aupr = np.nan
     
+    if test_has_expr_res.test_edge.sum() > 0:
+        test_has_expr_aupr = average_precision_score(test_has_expr_res.test_edge.values.astype(int), test_has_expr_res[metric].values.astype(float))
+    else:
+        test_has_expr_aupr = np.nan
+
     ###########################################################  
 
     n_test = res.test_edge.sum()
@@ -211,6 +244,7 @@ def eval_edge_inference(res, data, metric):
     n_train = res.train_edge.sum()
     n_neg = res.negative_edge.sum()
     n_test_tft_isolate = (res.test_tft & res.isolate_target).sum()
+    n_test_has_expr = (res.test_edge & res.has_expr).sum()
 
     ###########################################################  
 
@@ -218,6 +252,7 @@ def eval_edge_inference(res, data, metric):
             'test': {'auroc': test_auroc, 'aupr': test_aupr, 'mrr': mrr_test, 'top1_acc': top1_acc_test, 'top10_acc': top10_acc_test, 'top100_acc': top100_acc_test, 'n': n_test},
             'test_tft': {'auroc': test_tft_auroc, 'aupr': test_tft_aupr, 'mrr': mrr_test_tft, 'top1_acc': top1_acc_test_tft, 'top10_acc': top10_acc_test_tft, 'top100_acc': top100_acc_test_tft, 'n': n_test_tft},
             'test_tft_isolate': {'auroc': test_tft_isolate_auroc, 'aupr': test_tft_isolate_aupr, 'mrr': mrr_test_tft_isolate, 'top1_acc': top1_acc_test_tft_isolate, 'top10_acc': top10_acc_test_tft_isolate, 'top100_acc': top100_acc_test_tft_isolate, 'n': n_test_tft_isolate},
+            'test_has_expr': {'auroc': test_has_expr_auroc, 'aupr': test_has_expr_aupr, 'mrr': mrr_test_has_expr, 'top1_acc': top1_acc_test_has_expr, 'top10_acc': top10_acc_test_has_expr, 'top100_acc': top100_acc_test_has_expr, 'n': n_test_has_expr},
             'neg': {'auroc': None, 'aupr': None, 'mrr': mrr_neg, 'top1_acc': top1_acc_neg, 'top10_acc': top10_acc_neg, 'top100_acc': top100_acc_neg, 'n': n_neg}}
     
     
@@ -285,3 +320,103 @@ def filtered_rank(res, metric, neg_col='negative_edge'):
         ranks.loc[g.index] = local_ranks
 
     return ranks.to_numpy() + 1, max_ranks.to_numpy() + 1
+
+
+def _subset_metrics(res, metric, pos_col, neg_col='negative_edge'):
+    '''Compute rank and AUROC metrics for one positive subset vs negatives.'''
+    pos_mask = res[pos_col].fillna(False).astype(bool)
+    n_pos = int(pos_mask.sum())
+
+    out = {
+        'n': n_pos,
+        'auroc': None,
+        'aupr': None,
+        'mrr': None,
+        'top1_acc': None,
+        'top10_acc': None,
+        'top100_acc': None,
+    }
+    if n_pos == 0:
+        return out
+
+    ranks, _ = filtered_rank(res, metric, neg_col=neg_col)
+    res = res.assign(rank=ranks)
+    pos_ranks = res.loc[pos_mask, 'rank'].astype(float)
+
+    out['mrr'] = float(np.mean(1.0 / pos_ranks))
+    out['top1_acc'] = float(np.mean(pos_ranks <= 1))
+    out['top10_acc'] = float(np.mean(pos_ranks <= 10))
+    out['top100_acc'] = float(np.mean(pos_ranks <= 100))
+
+    eval_res = res[(pos_mask | res[neg_col].fillna(False).astype(bool))].copy()
+    if eval_res[neg_col].sum() > 0 and eval_res[pos_col].sum() > 0:
+        y = eval_res[pos_col].fillna(False).astype(int).values
+        scores = eval_res[metric].astype(float).values
+        if len(np.unique(y)) > 1:
+            out['auroc'] = float(roc_auc_score(y, scores))
+            out['aupr'] = float(average_precision_score(y, scores))
+    return out
+
+
+def eval_edge_inference_any(res, data, metric):
+    '''Evaluate edge inference on any function->function edge type.
+
+    Expects ``res`` with columns ``source``, ``target``, ``train_edge``,
+    ``val_edge``, ``test_edge``, and the score column named by ``metric``.
+    Optionally accepts ``full_edge`` for an additional positive partition.
+    Negatives are edges that are not train, val, test, or full.
+
+    Returns a nested dict with keys ``overall`` (train/val/test/full/neg) and
+    ``by_edge_type`` (per src_type->dst_type breakdown).
+    '''
+    res = res.copy()
+    has_full = 'full_edge' in res.columns
+    bool_cols = ('train_edge', 'val_edge', 'test_edge')
+    if has_full:
+        bool_cols = bool_cols + ('full_edge',)
+    for col in bool_cols:
+        if col not in res.columns:
+            res[col] = False
+        res[col] = res[col].fillna(False).astype(bool)
+
+    res = res.assign(
+        source_type=lambda x: x.source.str.split('__', expand=True)[0],
+        target_type=lambda x: x.target.str.split('__', expand=True)[0],
+    )
+    res = res.assign(
+        source_genesymbol=lambda x: x.source.str.split('__', expand=True)[1],
+        target_genesymbol=lambda x: x.target.str.split('__', expand=True)[1],
+    )
+    res = res[lambda x: x.source_genesymbol != x.target_genesymbol]
+
+    if has_full:
+        res = res.assign(
+            negative_edge=lambda x: ~(x.train_edge | x.val_edge | x.test_edge | x.full_edge),
+        )
+    else:
+        res = res.assign(
+            negative_edge=lambda x: ~(x.train_edge | x.val_edge | x.test_edge),
+        )
+
+    overall = {
+        'train': _subset_metrics(res, metric, 'train_edge'),
+        'val': _subset_metrics(res, metric, 'val_edge'),
+        'test': _subset_metrics(res, metric, 'test_edge'),
+        'neg': _subset_metrics(res, metric, 'negative_edge', neg_col='negative_edge'),
+    }
+    if has_full:
+        overall['full'] = _subset_metrics(res, metric, 'full_edge')
+
+    by_edge_type = {}
+    for (src_t, dst_t), g in res.groupby(['source_type', 'target_type'], sort=False):
+        key = f'{src_t}->{dst_t}'
+        by_edge_type[key] = {
+            'train': _subset_metrics(g, metric, 'train_edge'),
+            'val': _subset_metrics(g, metric, 'val_edge'),
+            'test': _subset_metrics(g, metric, 'test_edge'),
+            'neg': _subset_metrics(g, metric, 'negative_edge', neg_col='negative_edge'),
+        }
+        if has_full:
+            by_edge_type[key]['full'] = _subset_metrics(g, metric, 'full_edge')
+
+    return {'overall': overall, 'by_edge_type': by_edge_type}

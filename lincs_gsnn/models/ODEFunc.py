@@ -10,6 +10,10 @@ class ODEFunc(torch.nn.Module):
         self.scale = scale
         self.edge_mask = None
         self.node_mask = None
+        # Optional per-batch function-node-activity features. Stays None for
+        # GSNNs trained without node_activity so the model() call below is
+        # byte-identical to the legacy invocation.
+        self.x_fn = None
         self.edge_index = model.edge_index
 
     def set_edge_mask(self, edge_mask):
@@ -18,10 +22,19 @@ class ODEFunc(torch.nn.Module):
     def set_node_mask(self, node_mask):
         self.node_mask = node_mask
 
+    def set_x_fn(self, x_fn):
+        self.x_fn = x_fn
+
     def forward(self, t, x):
         # x shape: (B, n_input_nodes)
-        
-        out = self.model(x, edge_mask=self.edge_mask, node_mask=self.node_mask) # (B, n_output_nodes) 
+
+        # Only forward x_fn when it was explicitly set so legacy GSNNs (no
+        # node_activity) keep their original call signature untouched.
+        # dx/dt saturation (dxdt_clip) lives inside the model (e.g. BIOGSNN)
+        # so the bounded dynamics are intrinsic and identical at pretrain and
+        # integrate time, rather than applied as a post-hoc wrapper here.
+        extra_kwargs = {} if self.x_fn is None else {'x_fn': self.x_fn}
+        out = self.model(x, edge_mask=self.edge_mask, node_mask=self.node_mask, **extra_kwargs) # (B, n_output_nodes) 
 
         out = out*self.scale
 
@@ -32,10 +45,11 @@ class ODEFunc(torch.nn.Module):
 
         return dxdt
 
-    def integrate(self, x, time, node_mask=None, edge_mask=None, method='dopri5', tol=1e-4):
+    def integrate(self, x, time, node_mask=None, edge_mask=None, x_fn=None, method='dopri5', tol=1e-4):
 
         self.set_node_mask(node_mask)
         self.set_edge_mask(edge_mask)
+        self.set_x_fn(x_fn)
 
         out = odeint(func=self, y0=x, t=time, method=method, atol=tol, rtol=tol) # shape: (n_time, B, n_input_nodes)
 

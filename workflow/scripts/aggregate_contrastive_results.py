@@ -26,36 +26,45 @@ def get_args():
                        help='Name prefix for output files (default: aggregated)')
     parser.add_argument('--keep_long', action='store_true',
                        help='Keep the intermediate long format CSV file')
+    parser.add_argument('--results_prefix', type=str, default='contrastive_results',
+                       help="Filename prefix for per-sample results "
+                            "(default: 'contrastive_results'; "
+                            "use 'non_contrastive_results' for the non-contrastive rule)")
 
     args = parser.parse_args()
     return args
 
 
+def find_model_dirs(input_dir):
+    """Find all model replicate directories in the input directory."""
+    model_dirs = sorted(glob.glob(os.path.join(input_dir, "model_*")))
+    model_dirs = [d for d in model_dirs if os.path.isdir(d)]
+    return model_dirs
+
+
 def find_sample_dirs(input_dir):
-    """Find all sample directories in the input directory."""
-    sample_dirs = sorted(glob.glob(os.path.join(input_dir, "sample_*")))
-    sample_dirs = [d for d in sample_dirs if os.path.isdir(d)]
-    return sample_dirs
+    """Backward-compatible alias for :func:`find_model_dirs`."""
+    return find_model_dirs(input_dir)
 
 
-def load_cres(sample_dir, sample_id):
-    """Load contrastive results CSV for a sample."""
-    csv_path = os.path.join(sample_dir, f'contrastive_results_{sample_id}.csv')
+def load_cres(sample_dir, sample_id, results_prefix='contrastive_results'):
+    """Load per-sample results CSV for a sample."""
+    csv_path = os.path.join(sample_dir, f'{results_prefix}_{sample_id}.csv')
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
         return df
     return None
 
 
-def load_out_dict(sample_dir, sample_id):
-    """Load out_dict (contrastive_results .pt file) for a sample."""
-    pt_path = os.path.join(sample_dir, f'contrastive_results_{sample_id}.pt')
+def load_out_dict(sample_dir, sample_id, results_prefix='contrastive_results'):
+    """Load out_dict (per-sample .pt file) for a sample."""
+    pt_path = os.path.join(sample_dir, f'{results_prefix}_{sample_id}.pt')
     if os.path.exists(pt_path):
         return torch.load(pt_path, weights_only=False)
     return None
 
 
-def concatenate_cres_long_format(sample_dirs, output_path):
+def concatenate_cres_long_format(sample_dirs, output_path, results_prefix='contrastive_results'):
     """
     Concatenate contrastive results in LONG format (memory efficient).
     Instead of wide merge, adds a 'sample_id' column to each DataFrame.
@@ -69,7 +78,7 @@ def concatenate_cres_long_format(sample_dirs, output_path):
     
     for sample_dir in sample_dirs:
         sample_id = os.path.basename(sample_dir)
-        cres = load_cres(sample_dir, sample_id)
+        cres = load_cres(sample_dir, sample_id, results_prefix=results_prefix)
         
         if cres is None:
             print(f'  - WARNING: No cres found for {sample_id}')
@@ -156,7 +165,7 @@ def pivot_long_to_wide(long_csv_path, wide_csv_path, merge_cols):
     return False
 
 
-def merge_cres_dataframes_incremental(sample_dirs):
+def merge_cres_dataframes_incremental(sample_dirs, results_prefix='contrastive_results'):
     """
     Merge contrastive results DataFrames incrementally from sample directories.
     Uses outer merge to include all edges across samples.
@@ -171,7 +180,7 @@ def merge_cres_dataframes_incremental(sample_dirs):
     
     for sample_dir in sample_dirs:
         sample_id = os.path.basename(sample_dir)
-        cres = load_cres(sample_dir, sample_id)
+        cres = load_cres(sample_dir, sample_id, results_prefix=results_prefix)
         
         if cres is None:
             print(f'  - WARNING: No cres found for {sample_id}')
@@ -202,7 +211,7 @@ def merge_cres_dataframes_incremental(sample_dirs):
     return merged
 
 
-def aggregate_out_dicts(sample_dirs, output_path):
+def aggregate_out_dicts(sample_dirs, output_path, results_prefix='contrastive_results'):
     """
     Aggregate out_dicts from all samples into a single dictionary.
     Loads each .pt file one at a time and adds to the aggregated dict.
@@ -212,7 +221,7 @@ def aggregate_out_dicts(sample_dirs, output_path):
     
     for sample_dir in sample_dirs:
         sample_id = os.path.basename(sample_dir)
-        out_dict = load_out_dict(sample_dir, sample_id)
+        out_dict = load_out_dict(sample_dir, sample_id, results_prefix=results_prefix)
         
         if out_dict is not None:
             aggregated[sample_id] = out_dict
@@ -258,7 +267,8 @@ if __name__ == '__main__':
     
     # Step 1: Stream concatenate to long format
     print('Step 1: Concatenating cres DataFrames to LONG format (streaming)...')
-    total_rows, merge_cols = concatenate_cres_long_format(sample_dirs, long_cres_path)
+    total_rows, merge_cols = concatenate_cres_long_format(
+        sample_dirs, long_cres_path, results_prefix=args.results_prefix)
     
     if total_rows > 0 and merge_cols is not None:
         print(f'  - Total rows in long format: {total_rows}')
@@ -284,7 +294,7 @@ if __name__ == '__main__':
     print('--'*40)
     print('Aggregating out_dicts...')
     out_dict_path = os.path.join(args.out, f'{args.name}_out_dict.pt')
-    n_aggregated = aggregate_out_dicts(sample_dirs, out_dict_path)
+    n_aggregated = aggregate_out_dicts(sample_dirs, out_dict_path, results_prefix=args.results_prefix)
     
     if n_aggregated == 0:
         print('WARNING: No out_dicts found')

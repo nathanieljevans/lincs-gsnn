@@ -13,6 +13,8 @@ import os
 from lincs_gsnn.data.DXDTDataset import DXDTDataset
 from torch.utils.data import DataLoader
 from lincs_gsnn.models.ODEWrapper import ODEWrapper
+from lincs_gsnn.proc.model_paths import gsnn_model_path
+from lincs_gsnn.proc.node_activity import load_node_activity_artifact
 from gsnn.interpret.ContrastiveGSNNExplainer import ContrastiveGSNNExplainer
 from gsnn.interpret.ContrastiveIGExplainer import ContrastiveIGExplainer
 from gsnn.interpret.ContrastiveOcclusionExplainer import ContrastiveOcclusionExplainer
@@ -26,8 +28,8 @@ def get_args():
                        help='Root directory of the gsnn outputs')
     parser.add_argument('--root_traj', type=str, required=True,
                        help='Root directory of the traj outputs')
-    parser.add_argument('--sample_id', type=str, required=True,
-                       help='Sample id of the sample to explain')
+    parser.add_argument('--model_id', type=str, required=True,
+                       help='Model replicate id (e.g. model_0)')
 
     parser.add_argument('--target_gene', type=str, required=True,
                        help='Target gene of interest')
@@ -71,19 +73,43 @@ def get_args():
                        choices=['edge', 'node'],
                        help='Target for the explanation (default: edge)')
 
+    parser.add_argument('--use_hypernetwork', action='store_true', default=False,
+                       help='Use the cell-line-conditioned hypernetwork artifact '
+                            '(pretrained_hnet_<sample_id>.pt) to materialize a '
+                            'separate GSNN per cell line. Falls back to the legacy '
+                            'single-model behavior if the artifact is missing.')
+
+    parser.add_argument('--node_activity_path', type=str, default=None,
+                       help='Path to the node_activity.pt artifact. Required when '
+                            'the loaded model has node_activity enabled; defaults '
+                            'to <root_gsnn>/bionetwork/node_activity.pt.')
+    parser.add_argument('--model_path', type=str, default=None,
+                       help='Path to GSNN checkpoint (.pt). Defaults to '
+                            'train/trained_model_<sample_id>.pt when present, '
+                            'else pretrain/pretrained_model_<sample_id>.pt.')
+
     args = parser.parse_args()
 
-    args.dxdt_dir = os.path.join(args.root_traj, f'predict_grid/{args.sample_id}/dxdt/')
-    args.obs_dir = os.path.join(args.root_traj, f'predict_grid/{args.sample_id}/obs/')
+    args.pred_dir = os.path.join(args.root_traj, 'predict_grid')
     
     args.data = torch.load(os.path.join(args.root_gsnn, 'bionetwork/bionetwork.pt'), weights_only=False)
-    args.model = torch.load(os.path.join(args.root_gsnn, f'pretrain/pretrained_model_{args.sample_id}.pt'), weights_only=False)
-    args.dxdt_scale = torch.load(os.path.join(args.root_gsnn, f'pretrain/dxdt_scale_{args.sample_id}.pt'), weights_only=False).item()
+    model_path = gsnn_model_path(args.root_gsnn, args.model_id, model_path=args.model_path)
+    args.model = torch.load(model_path, weights_only=False)
+    print(f'Loaded GSNN checkpoint: {model_path}')
+    args.dxdt_scale = torch.load(os.path.join(args.root_gsnn, f'pretrain/dxdt_scale_{args.model_id}.pt'), weights_only=False).item()
     args.x_names = pd.read_csv(os.path.join(args.root_traj, 'predict_grid/gene_names.csv'))['gene_names'].values.astype(str).tolist()
     args.dxdt_meta = pd.read_csv(os.path.join(args.root_traj, 'predict_grid/dxdt_meta.csv'))
 
     args.cond1 = args.dxdt_meta[(args.dxdt_meta['cell_iname'] == args.cell_line_1) & (args.dxdt_meta['pert_id'] == args.pert_id) & (args.dxdt_meta['dose'] == args.dose)]
     args.cond2 = args.dxdt_meta[(args.dxdt_meta['cell_iname'] == args.cell_line_2) & (args.dxdt_meta['pert_id'] == args.pert_id) & (args.dxdt_meta['dose'] == args.dose)] 
+
+    # Optionally load the hypernetwork artifact and materialize per-cell-line
+    # vanilla GSNNs. We keep args.model as the legacy "mean cell line" model
+    # (also produced by pretrain) for any code path that may still reference it.
+    args.hnet_artifact_path = os.path.join(args.root_gsnn, f'pretrain/pretrained_hnet_{args.model_id}.pt')
+    args.use_hypernetwork = bool(args.use_hypernetwork) and os.path.exists(args.hnet_artifact_path)
+    args.model_1 = None
+    args.model_2 = None
 
     # freeze the model 
     for param in args.model.parameters():
@@ -91,8 +117,73 @@ def get_args():
     args.model = args.model.eval()
 
     args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    args.t = torch.linspace(0, args.horizon, args.n_time_pts, device=args.device)
+    # The GSNN field is parameterized in NORMALIZED time: the full predict_grid
+    # trajectory spans tau in [0, 1] over time_max hours, and dx/dt is
+    # d(z)/d(tau). --horizon is given in HOURS, so map it onto normalized time
+    # (tau = hours / time_max) before integrating. Integrating on the raw hour
+    # axis drives the rollout to |z|~1e2-1e3 (same failure fixed in
+    # train_gsnn_with_odeint).
+    _time_max = float(pd.read_csv(os.path.join(args.pred_dir, 'pred_meta.csv'))['time_max'].iloc[0])
+    args.t = torch.linspace(0, args.horizon / _time_max, args.n_time_pts, device=args.device)
     args.model = args.model.to(args.device)
+
+    # ------------------------------------------------------------------
+    # Optional per-function-node activity feature.  When the loaded GSNN
+    # was trained with `node_activity=True`, look up the per-cell-line
+    # x_fn tensors for both arms of the contrast and stash them on args.
+    # Mutually exclusive with --use_hypernetwork (cell-line conditioning
+    # already lives in args.model_1/args.model_2 in that case).
+    # ------------------------------------------------------------------
+    args.x_fn_1 = None
+    args.x_fn_2 = None
+    if getattr(args.model, 'node_activity', False):
+        if args.use_hypernetwork:
+            raise ValueError(
+                "Loaded model has node_activity=True but --use_hypernetwork was set; "
+                "the two cell-line conditioning mechanisms are mutually exclusive."
+            )
+        na_path = args.node_activity_path or os.path.join(args.root_gsnn, 'bionetwork/node_activity.pt')
+        if not os.path.exists(na_path):
+            raise FileNotFoundError(
+                f"Loaded model has node_activity=True but artifact not found at {na_path}. "
+                "Pass --node_activity_path explicitly or rebuild with `make_bio_network.py --node_activity`."
+            )
+        na_payload = load_node_activity_artifact(na_path, node_names_dict=args.data.node_names_dict)
+        for cl in (args.cell_line_1, args.cell_line_2):
+            if cl not in na_payload['x_fn_by_ciname']:
+                raise KeyError(
+                    f"node_activity artifact does not contain cell_iname={cl!r}. "
+                    f"Available: {sorted(na_payload['x_fn_by_ciname'])[:5]}..."
+                )
+        args.x_fn_1 = na_payload['x_fn_by_ciname'][args.cell_line_1].unsqueeze(0).to(args.device)
+        args.x_fn_2 = na_payload['x_fn_by_ciname'][args.cell_line_2].unsqueeze(0).to(args.device)
+        print(f'node_activity: loaded x_fn for {args.cell_line_1} and {args.cell_line_2} '
+              f'(shape per cell={tuple(args.x_fn_1.shape)}) from {na_path}')
+
+    if args.use_hypernetwork:
+        # Local import keeps the legacy code path free of any hnet dependency.
+        from lincs_gsnn.models.HnetGSNN import (
+            cell_onehot,
+            load_hnet_artifact,
+            materialize_gsnn,
+        )
+
+        loaded = load_hnet_artifact(args.hnet_artifact_path, args.data)
+        hnet = loaded['hnet'].to(args.device).eval()
+        cell_lines = loaded['cell_lines']
+
+        C1 = cell_onehot(args.cell_line_1, cell_lines, device=args.device)
+        C2 = cell_onehot(args.cell_line_2, cell_lines, device=args.device)
+        with torch.no_grad():
+            args.model_1 = materialize_gsnn(hnet, C1).to(args.device).eval()
+            args.model_2 = materialize_gsnn(hnet, C2).to(args.device).eval()
+        for p in args.model_1.parameters():
+            p.requires_grad = False
+        for p in args.model_2.parameters():
+            p.requires_grad = False
+
+        print(f'Hypernetwork mode: materialized cell-line-specific GSNNs for '
+              f'{args.cell_line_1} and {args.cell_line_2}.')
 
     args.target_gene = 'GENE__' + args.target_gene 
 
@@ -112,15 +203,10 @@ def get_args():
 
 
 def retrieve_data(dataloader):
-
-    xs = []; ys = [] 
-    for i, (x, y) in enumerate(dataloader):
-        xs.append(x)
-        ys.append(y)
-    xs = torch.cat(xs, dim=0)
-    ys = torch.cat(ys, dim=0)
-
-    return xs, ys 
+    xs = []
+    for batch in dataloader:
+        xs.append(batch[0])
+    return torch.cat(xs, dim=0)
 
 def get_x(args): 
 
@@ -128,8 +214,7 @@ def get_x(args):
                       input_names=args.data.node_names_dict['input'], 
                       output_names=args.data.node_names_dict['output'],
                       src_names=args.x_names,
-                      obs_dir=args.obs_dir,
-                      dxdt_dir=args.dxdt_dir,
+                      pred_dir=args.pred_dir,
                       scale=args.dxdt_scale)
 
     dataloader1 = DataLoader(dataset1, batch_size=8, shuffle=False)
@@ -138,29 +223,36 @@ def get_x(args):
                       input_names=args.data.node_names_dict['input'], 
                       output_names=args.data.node_names_dict['output'],
                       src_names=args.x_names,
-                      obs_dir=args.obs_dir,
-                      dxdt_dir=args.dxdt_dir,
+                      pred_dir=args.pred_dir,
                       scale=args.dxdt_scale)
 
     dataloader2 = DataLoader(dataset2, batch_size=8, shuffle=False)
 
-    x1, _ = retrieve_data(dataloader1)
-    x2, _ = retrieve_data(dataloader2)
+    x1 = retrieve_data(dataloader1)
+    x2 = retrieve_data(dataloader2)
 
     return x1, x2
 
-def predict_xt(args, x):
+def predict_xt(args, x, model=None, x_fn=None):
 
     x0 = x[[0]]
 
-    ode_gsnn = ODEWrapper(args.model, 
+    if model is None:
+        model = args.model
+
+    ode_gsnn = ODEWrapper(model,
                         args.data, 
                         args.dxdt_scale, 
                         t=args.t,     
                         method= args.method, 
                         tol=args.tol)
 
-    xt_hat = ode_gsnn(x0.to(args.device))
+    # Pass x_fn through ODEWrapper -> ODEFunc.set_x_fn when node_activity
+    # is enabled; otherwise the call is byte-identical to the legacy form.
+    if x_fn is not None:
+        xt_hat = ode_gsnn(x0.to(args.device), x_fn=x_fn)
+    else:
+        xt_hat = ode_gsnn(x0.to(args.device))
 
     # Use x[0] to get shape (N_features,) then expand to (T, N_features)
     xt_hat_input = x[0].clone().unsqueeze(0).expand(xt_hat.shape[0], -1,).clone()
@@ -169,19 +261,61 @@ def predict_xt(args, x):
     return xt_hat_input, xt_hat
 
 
-def run_contrastive_explanation(args, x1, x2, xt_hat_w_inputs_1, xt_hat_w_inputs_2, target_ix): 
+def _build_ode_router(args, x0_1, x0_2):
+    """For ContrastiveGSNNExplainer (which operates on the ODE rollout):
+    build two separate ODEWrappers (one per cell line) and route by the
+    data_ptr of the *initial* state ``x0`` so the integrator's internal
+    fresh state tensors never need re-routing."""
+    ode_1 = ODEWrapper(args.model_1, args.data, args.dxdt_scale,
+                       t=args.t, method=args.method, tol=args.tol)
+    ode_2 = ODEWrapper(args.model_2, args.data, args.dxdt_scale,
+                       t=args.t, method=args.method, tol=args.tol)
+    from lincs_gsnn.models.HnetGSNN import CellLineRouter
+    return CellLineRouter(ode_1, ode_2, x0_1, x0_2)
 
+
+def _build_static_router(args, *pairs):
+    """For ContrastiveIG/Occlusion (which operate on trajectory rollouts and
+    use cat-batch and split-baseline patterns): a router around the bare
+    GSNN clones. Pre-registers all (x1_ref, x2_ref) pairs the explainers
+    will pass."""
+    from lincs_gsnn.models.HnetGSNN import CellLineRouter
+    if not pairs:
+        raise ValueError("_build_static_router requires at least one (x1, x2) pair")
+    x1_first, x2_first = pairs[0]
+    router = CellLineRouter(args.model_1, args.model_2, x1_first, x2_first)
+    for x1_ref, x2_ref in pairs[1:]:
+        router.register_pair(x1_ref, x2_ref)
+    return router
+
+
+def run_contrastive_explanation(args, x1, x2, xt_hat_w_inputs_1, xt_hat_w_inputs_2, target_ix):
+
+    # Pre-move inputs to device so the explainers' internal .to(device) is a
+    # no-op (preserves data_ptr-based dispatch in CellLineRouter).
+    x0_1 = x1[[0]].to(args.device)
+    x0_2 = x2[[0]].to(args.device)
+    xt_hat_w_inputs_1 = xt_hat_w_inputs_1.to(args.device)
+    xt_hat_w_inputs_2 = xt_hat_w_inputs_2.to(args.device)
+
+    # Per-side model kwargs for node_activity-enabled models.  Each tensor
+    # has leading dim 1 so the explainers' slice/repeat helpers broadcast
+    # cleanly across whatever batch shape they build internally.
+    mk1 = {'x_fn': args.x_fn_1} if args.x_fn_1 is not None else None
+    mk2 = {'x_fn': args.x_fn_2} if args.x_fn_2 is not None else None
 
     ####################################################################################################
     # GSNN Explainer
     ####################################################################################################
-
-    ode_gsnn = ODEWrapper(args.model, 
-                        args.data, 
-                        args.dxdt_scale, 
-                        t=args.t,     
-                        method= args.method, 
-                        tol=args.tol)
+    if args.use_hypernetwork:
+        ode_gsnn = _build_ode_router(args, x0_1, x0_2)
+    else:
+        ode_gsnn = ODEWrapper(args.model,
+                            args.data,
+                            args.dxdt_scale,
+                            t=args.t,
+                            method=args.method,
+                            tol=args.tol)
 
     explainer = ContrastiveGSNNExplainer(ode_gsnn, 
                                         args.data,
@@ -193,35 +327,47 @@ def run_contrastive_explanation(args, x1, x2, xt_hat_w_inputs_1, xt_hat_w_inputs
                                         free_edges=args.free_edges)
 
 
-    x0_1 = x1[[0]]                                         
-    x0_2 = x2[[0]]
-    cres_gsnn = explainer.explain(x0_1.to(args.device), 
-                                  x0_2.to(args.device), 
+    cres_gsnn = explainer.explain(x0_1,
+                                  x0_2,
                                   target_idx=args.target_gene_output_ix, 
-                                  target=args.explanation_target)
+                                  target=args.explanation_target,
+                                  model_kwargs1=mk1,
+                                  model_kwargs2=mk2)
 
     ####################################################################################################
     # IG Explainer
     ####################################################################################################
-    
-    explainer = ContrastiveIGExplainer(args.model.to(args.device), args.data)
+    if args.use_hypernetwork:
+        static_model = _build_static_router(
+            args,
+            (xt_hat_w_inputs_1, xt_hat_w_inputs_2),
+            (x0_1, x0_2),
+        )
+    else:
+        static_model = args.model
 
-    cres_ig = explainer.explain(xt_hat_w_inputs_1.to(args.device), 
-                                xt_hat_w_inputs_2.to(args.device), 
+    explainer = ContrastiveIGExplainer(static_model, args.data)
+
+    cres_ig = explainer.explain(xt_hat_w_inputs_1,
+                                xt_hat_w_inputs_2,
                                 target_idx=args.target_gene_output_ix, 
                                 element_mask=cres_gsnn.score.values > 0.5,
-                                target=args.explanation_target) 
+                                target=args.explanation_target,
+                                model_kwargs1=mk1,
+                                model_kwargs2=mk2)
 
     ####################################################################################################
     # Occlusion Explainer
     ####################################################################################################
-    explainer = ContrastiveOcclusionExplainer(args.model.to(args.device), args.data)
+    explainer = ContrastiveOcclusionExplainer(static_model, args.data)
 
-    cres_occ = explainer.explain(xt_hat_w_inputs_1.to(args.device), 
-                                xt_hat_w_inputs_2.to(args.device), 
+    cres_occ = explainer.explain(xt_hat_w_inputs_1,
+                                xt_hat_w_inputs_2,
                                 target_idx=args.target_gene_output_ix, 
                                 element_mask=cres_gsnn.score.values > 0.5,
-                                target=args.explanation_target)
+                                target=args.explanation_target,
+                                model_kwargs1=mk1,
+                                model_kwargs2=mk2)
 
     ####################################################################################################
     # Combine Results
@@ -246,13 +392,21 @@ if __name__ == '__main__':
     print('--'*40)
 
     x1, x2 = get_x(args) 
-    xt_hat_w_inputs_1, xt_hat_1 = predict_xt(args, x1)
-    xt_hat_w_inputs_2, xt_hat_2 = predict_xt(args, x2) 
+    # Use cell-line-specific models for trajectory rollout when in
+    # hypernetwork mode; otherwise fall back to the single legacy model.
+    # When node_activity is enabled, the (single) model is conditioned on
+    # the cell line via x_fn instead.
+    xt_hat_w_inputs_1, xt_hat_1 = predict_xt(args, x1,
+                                              model=args.model_1 if args.use_hypernetwork else None,
+                                              x_fn=args.x_fn_1)
+    xt_hat_w_inputs_2, xt_hat_2 = predict_xt(args, x2,
+                                              model=args.model_2 if args.use_hypernetwork else None,
+                                              x_fn=args.x_fn_2)
 
     cres = run_contrastive_explanation(args, x1, x2, xt_hat_w_inputs_1, xt_hat_w_inputs_2, args.target_gene_output_ix)
 
     # Save contrastive results as CSV
-    cres.to_csv(os.path.join(args.out, f'contrastive_results_{args.sample_id}.csv'), index=False)
+    cres.to_csv(os.path.join(args.out, f'contrastive_results_{args.model_id}.csv'), index=False)
 
     # Save out_dict with cres, trajectory predictions and metadata
     out_dict = {
@@ -271,7 +425,7 @@ if __name__ == '__main__':
         'n_time_pts': args.n_time_pts,
         't': args.t.cpu().numpy(),
     }
-    torch.save(out_dict, os.path.join(args.out, f'contrastive_results_{args.sample_id}.pt'))
+    torch.save(out_dict, os.path.join(args.out, f'contrastive_results_{args.model_id}.pt'))
 
     print(f'Contrastive explanation results saved to {args.out}')
     print('--'*40)

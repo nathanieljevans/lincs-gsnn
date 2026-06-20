@@ -20,7 +20,7 @@ class ODEWrapper(torch.nn.Module):
         self.num_nodes = model.num_nodes
         self.return_last_ = return_last
     
-    def forward(self, x0, edge_mask=None, node_mask=None):
+    def forward(self, x0, edge_mask=None, node_mask=None, x_fn=None):
 
         B, N = x0.shape
 
@@ -28,6 +28,7 @@ class ODEWrapper(torch.nn.Module):
                                      time = self.t_,
                                      node_mask=node_mask, 
                                      edge_mask=edge_mask, 
+                                     x_fn=x_fn,
                                      method=self.method_, 
                                      tol=self.tol_) # (T, B, N)
 
